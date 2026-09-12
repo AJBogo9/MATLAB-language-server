@@ -13,6 +13,18 @@ interface MCompletionData {
     widgetData?: MWidgetData
     widgetType?: string
     signatures?: MSignatureData | MSignatureData[] // If there is only one signature, it is not given as an array
+    // Global completions that apply regardless of which argument the cursor is
+    // in. MATLAB sends these separately from the per-argument choices, and they
+    // are the only source for e.g. `magic` while the cursor sits in a
+    // name-value argument.
+    shared?: MSharedData
+}
+
+interface MSharedData {
+    status?: string
+    value?: string
+    widgetType?: string
+    widgetData?: MWidgetData
 }
 
 interface MWidgetData {
@@ -23,7 +35,10 @@ interface MWidgetData {
 interface MCompletionChoice {
     completion: string
     matchType: string
-    purpose: string
+    // MATLAB omits this key entirely for user-defined symbols, so it must be
+    // optional: the previous non-optional declaration meant `detail` was
+    // assigned `undefined` against a type that promised a string.
+    purpose?: string
     displayString?: string
 }
 
@@ -31,6 +46,12 @@ interface MSignatureData {
     functionName: string
     inputArguments?: MArgumentData | MArgumentData[] // If there is only one argument, it is not given as an array
     outputArguments?: MArgumentData | MArgumentData[] // If there is only one argument, it is not given as an array
+    // 'primary' | 'secondary' | 'suggested'. Exactly one signature per response
+    // is 'suggested', and it is the one MATLAB itself would highlight.
+    promotion?: string
+    // Present and true on overloads MATLAB considers redundant. Not a reason to
+    // drop them: for `tic(` the only signature is both duplicated and suggested.
+    duplicated?: boolean
 }
 
 interface MArgumentData {
@@ -201,6 +222,13 @@ class CompletionSupportProvider {
         // Gather completions from top-level object. This should find function completions.
         this.gatherCompletions(completionData, completionsMap)
 
+        // Gather the shared (global) completions. Without this, typing
+        // `noDocArgs(1,M` offers only the name-value key `Method` and loses all
+        // 344 global choices MATLAB returned alongside it.
+        if (completionData.shared != null) {
+            this.gatherCompletions(completionData.shared, completionsMap)
+        }
+
         // Gather completions from each signature. This should find function argument completions.
         let signatures = completionData.signatures
         if (signatures != null) {
@@ -246,7 +274,7 @@ class CompletionSupportProvider {
      * @param completionDataObj Raw completion or argument data
      * @param completionMap A map in which to store info about possible completions
      */
-    private gatherCompletions (completionDataObj: MCompletionData | MArgumentData, completionMap: Map<string, { kind: CompletionItemKind, doc: string, insertText: string }>): void {
+    private gatherCompletions (completionDataObj: MCompletionData | MArgumentData | MSharedData, completionMap: Map<string, { kind: CompletionItemKind, doc: string, insertText: string }>): void {
         let choices = completionDataObj.widgetData?.choices
         if (choices == null) {
             return
@@ -285,7 +313,7 @@ class CompletionSupportProvider {
 
             completionMap.set(completion, {
                 kind: MatlabCompletionToKind[choice.matchType] ?? CompletionItemKind.Function,
-                doc: choice.purpose,
+                doc: choice.purpose ?? '',
                 insertText: choice.completion ?? ''
             })
         })
@@ -312,12 +340,13 @@ class CompletionSupportProvider {
             signatures: []
         }
 
+        // Index of the signature MATLAB itself would highlight, discovered while
+        // building. Computed against the built array rather than the raw data so
+        // the index still lines up when a signature is skipped.
+        let suggestedSignatureIndex = -1
+
         // Parse each signature
         signatureData.forEach(sigData => {
-            const params: ParameterInformation[] = []
-
-            // Handle function inputs
-            const argNames: string[] = []
             let inputArguments = sigData.inputArguments
 
             if (inputArguments == null) {
@@ -326,32 +355,8 @@ class CompletionSupportProvider {
 
             inputArguments = Array.isArray(inputArguments) ? inputArguments : [inputArguments]
 
-            inputArguments.forEach((inputArg, index) => {
-                let paramDoc = ''
-                if (inputArg.purpose != null) {
-                    paramDoc += inputArg.purpose
-                }
-                if (inputArg.valueSummary != null) {
-                    paramDoc += (paramDoc.length > 0 ? '\n' : '') + inputArg.valueSummary
-                }
-
-                const paramDocArgs = paramDoc.length > 0 ? [paramDoc] : []
-                params.push(ParameterInformation.create(inputArg.name, ...paramDocArgs))
-
-                argNames.push(inputArg.name)
-                if (inputArg.status === 'presenting') {
-                    signatureHelp.activeParameter = index
-                }
-            })
-
-            let argStr = ''
-            if (argNames.length === 1) {
-                argStr = argNames[0]
-            } else if (argNames.length > 1) {
-                argStr = argNames.join(', ')
-            }
-
-            // Handle function outputs
+            // Handle function outputs first: they prefix the label, so their
+            // width shifts every parameter offset.
             let outStr = ''
             let outputArguments = sigData.outputArguments
             if (outputArguments != null) {
@@ -362,13 +367,77 @@ class CompletionSupportProvider {
                 outStr += ' = '
             }
 
-            const id = `${outStr}${sigData.functionName}(${argStr})`
-            signatureHelp.signatures.push(SignatureInformation.create(
-                id,
+            const labelPrefix = `${outStr}${sigData.functionName}(`
+
+            const params: ParameterInformation[] = []
+            const argNames: string[] = []
+
+            // Each signature carries its own active parameter. MATLAB may mark
+            // several arguments as "presenting" for a variadic overload (plot's
+            // X,Y,LineSpec triples report [3,4,7]); the first is the one the
+            // cursor is actually in.
+            let activeParameterForSignature: number | undefined
+
+            inputArguments.forEach((inputArg, index) => {
+                let paramDoc = ''
+                if (inputArg.purpose != null) {
+                    paramDoc += inputArg.purpose
+                }
+                if (inputArg.valueSummary != null) {
+                    paramDoc += (paramDoc.length > 0 ? '\n' : '') + inputArg.valueSummary
+                }
+
+                // Address the parameter by its offset range in the label rather
+                // than by name. zeros(sz,sz,typename) declares two parameters
+                // both called "sz", and a string label makes the client resolve
+                // both to the first occurrence and underline the wrong one.
+                const offsetStart = labelPrefix.length + argNames.join(', ').length +
+                    (argNames.length > 0 ? 2 : 0)
+                const labelOffsets: [number, number] = [offsetStart, offsetStart + inputArg.name.length]
+
+                const paramDocArgs = paramDoc.length > 0 ? [paramDoc] : []
+                params.push(ParameterInformation.create(labelOffsets, ...paramDocArgs))
+
+                argNames.push(inputArg.name)
+
+                if (inputArg.status === 'presenting' && activeParameterForSignature === undefined) {
+                    activeParameterForSignature = index
+                }
+            })
+
+            const label = `${labelPrefix}${argNames.join(', ')})`
+
+            const signatureInformation = SignatureInformation.create(
+                label,
                 undefined,
                 ...params
-            ))
+            )
+
+            // LSP 3.16 lets each signature carry its own active parameter, and
+            // the client advertises activeParameterSupport unconditionally.
+            // Without this the last overload's value overwrote every other
+            // overload's, so for `plot(x,y,` three of seven signatures
+            // underlined the wrong argument.
+            if (activeParameterForSignature !== undefined) {
+                signatureInformation.activeParameter = activeParameterForSignature
+            }
+
+            if (sigData.promotion === 'suggested' && suggestedSignatureIndex === -1) {
+                suggestedSignatureIndex = signatureHelp.signatures.length
+            }
+
+            // Keep the top-level value as the pre-3.16 fallback: last writer
+            // wins there, matching the previous behaviour for old clients.
+            if (activeParameterForSignature !== undefined) {
+                signatureHelp.activeParameter = activeParameterForSignature
+            }
+
+            signatureHelp.signatures.push(signatureInformation)
         })
+
+        if (suggestedSignatureIndex !== -1) {
+            signatureHelp.activeSignature = suggestedSignatureIndex
+        }
 
         return signatureHelp
     }

@@ -16,7 +16,11 @@ function compResultsStruct = filterCompletionResults (completionResultsStr)
     completionResults = jsondecode(completionResultsStr);
 
     compResultsStruct = struct;
-    propsToKeep = ["widgetData", "widgetType", "signatures"];
+    % "shared" carries the global completion list that applies regardless of
+    % which argument the cursor is in. Dropping it loses real completions:
+    % typing noDocArgs(1,M offers only "Method", because the 344 shared choices
+    % (magic, makehgtform, makima, mapreduce, ...) never reach the client.
+    propsToKeep = ["widgetData", "widgetType", "signatures", "shared"];
 
     for prop = propsToKeep
         if isfield(completionResults, prop)
