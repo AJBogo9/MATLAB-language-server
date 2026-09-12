@@ -35,6 +35,12 @@ interface MHoverData {
     truncated?: number
 }
 
+/**
+ * Matches a function declaration and captures its name, covering the no-output,
+ * single-output and bracketed-output-list forms.
+ */
+const FUNCTION_DECLARATION_NAME = /^\s*function\s+(?:\[[^\]]*\]\s*=\s*|[A-Za-z][A-Za-z0-9_]*\s*=\s*)?([A-Za-z][A-Za-z0-9_]*)/
+
 /** A composed card, cached by resolved topic and MATLAB release. */
 interface CachedCard {
     markdown: string
@@ -138,7 +144,7 @@ class HoverSupportProvider {
         // Never run help() on something the index says is a variable.
         if (classified?.classification === SymbolClassification.Variable) {
             return this.toHover(
-                this.renderVariableCard(expression.unqualifiedTarget, text, expression.unqualifiedTarget),
+                this.renderVariableCard(expression.unqualifiedTarget, text, expression.unqualifiedTarget, line),
                 hoverRange
             )
         }
@@ -263,13 +269,13 @@ class HoverSupportProvider {
      * reflect the last run rather than the buffer, so it belongs behind an
      * explicit opt-in and an explicit staleness label, not here.
      */
-    private renderVariableCard (name: string, documentText: string, symbolName: string): string {
+    private renderVariableCard (name: string, documentText: string, symbolName: string, line: number): string {
         const parts: string[] = ['**' + name + '**  ·  variable']
 
         // An arguments block declaration is the richest static statement about a
         // variable that MATLAB itself cannot give you.
         const lines = documentText.split(/\r?\n/)
-        const enclosing = this.findEnclosingFunctionName(lines, symbolName)
+        const enclosing = this.findEnclosingFunctionName(lines, line)
         if (enclosing != null) {
             const info = buildOfflineSymbolInfo(documentText, enclosing)
             const declaration = info?.argumentDeclarations.find(d => d.name === symbolName || d.name.startsWith(symbolName + '.'))
@@ -285,12 +291,14 @@ class HoverSupportProvider {
         return parts.join('\n')
     }
 
-    private findEnclosingFunctionName (lines: string[], _symbolName: string): string | null {
-        // The index is the right oracle for scope, but this path runs when the
-        // file is not indexed. Fall back to the first function declaration,
-        // which is correct for the overwhelmingly common single-function file.
-        for (const line of lines) {
-            const match = /^\s*function\s+(?:\[[^\]]*\]\s*=\s*|[A-Za-z][A-Za-z0-9_]*\s*=\s*)?([A-Za-z][A-Za-z0-9_]*)/.exec(line)
+    private findEnclosingFunctionName (lines: string[], hoverLine: number): string | null {
+        // Scan upward from the hover position for the nearest preceding function
+        // declaration. Taking the first declaration in the file instead would
+        // attribute a variable in the third local function to the first one's
+        // arguments block, and show its type and validators for a completely
+        // different parameter that happens to share a name.
+        for (let i = Math.min(hoverLine, lines.length - 1); i >= 0; i--) {
+            const match = FUNCTION_DECLARATION_NAME.exec(lines[i])
             if (match != null) {
                 return match[1]
             }

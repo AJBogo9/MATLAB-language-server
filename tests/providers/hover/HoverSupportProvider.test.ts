@@ -170,6 +170,33 @@ describe('HoverSupportProvider', () => {
             assert.ok(valueOf(hover).includes('variable'))
         })
 
+        it('should read the arguments block of the ENCLOSING function, not the first in the file', async () => {
+            // Two local functions each declaring a parameter called x with
+            // different constraints. Hovering x in the second must not show the
+            // first function's declaration.
+            setup([
+                'function y = first(x)',      // 0
+                'arguments',                  // 1
+                '    x (1,1) double = 111',   // 2
+                'end',                        // 3
+                'y = x;',                     // 4
+                'end',                        // 5
+                '',                           // 6
+                'function z = second(x)',     // 7
+                'arguments',                  // 8
+                '    x (1,1) string = "SECOND"', // 9
+                'end',                        // 10
+                'z = x;',                     // 11
+                'end'                         // 12
+            ].join('\n'))
+            classifyAs(SymbolClassification.Variable, 'x')
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(11, 4), documentManager))
+
+            assert.ok(text.includes('SECOND'), 'should describe the enclosing function\'s parameter')
+            assert.ok(!text.includes('111'), 'must not show the first function\'s declaration')
+        })
+
         it('should show an arguments-block declaration for a validated parameter', async () => {
             setup([
                 'function y = f(x)',
