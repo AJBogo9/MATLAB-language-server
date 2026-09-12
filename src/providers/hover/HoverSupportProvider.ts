@@ -1,0 +1,534 @@
+// Copyright 2026 Andreas Bogossian
+
+import { CancellationToken, Hover, HoverParams, MarkupKind, Range, TextDocuments } from 'vscode-languageserver'
+import { TextDocument } from 'vscode-languageserver-textdocument'
+import MatlabLifecycleManager from '../../lifecycle/MatlabLifecycleManager'
+import MVM from '../../mvm/impl/MVM'
+import Logger from '../../logging/Logger'
+import parse from '../../mvm/MdaParser'
+import FileInfoIndex from '../../indexing/FileInfoIndex'
+import {
+    classifySymbolAtPosition, RequestType, SymbolClassification, reportTelemetry
+} from '../../indexing/SymbolSearchService'
+import { getExpressionAtPosition } from '../../utils/ExpressionUtils'
+import { isInCommentOrString } from './CommentStringScanner'
+import { getOperatorHelp, findOperatorAtPosition } from './OperatorHelp'
+import { buildOfflineSymbolInfo, renderArgumentsTable, OfflineSymbolInfo } from './OfflineHoverBuilder'
+import HoverCache from './HoverCache'
+
+/**
+ * Raw hover payload returned by matlabls.handlers.hover.getHoverData.
+ *
+ * Every flag is a double, not a logical: MdaParser handles int8..uint64, single,
+ * double, string, char, cell and struct, and falls through to a "Unexpected
+ * mwtype encountered" log for anything else.
+ */
+interface MHoverData {
+    topic?: string
+    helpText?: string
+    signatures?: string | string[]
+    isResolved?: number
+    isBuiltin?: number
+    whichPath?: string
+    docUrl?: string
+    shadowedBy?: string
+    truncated?: number
+}
+
+/** A composed card, cached by resolved topic and MATLAB release. */
+interface CachedCard {
+    markdown: string
+}
+
+/**
+ * Provides textDocument/hover.
+ *
+ * The ordering here is the whole design. Classification comes before any call to
+ * help(), because MATLAB resolves an unknown name to an unrelated topic rather
+ * than failing, and common variable names (`i`, `x`, `idx`, `data`, `results`)
+ * all resolve to something confidently wrong.
+ */
+class HoverSupportProvider {
+    private readonly cache = new HoverCache<CachedCard>(256)
+
+    // Deliberately does not take a DocumentIndexer. NavigationSupportProvider
+    // awaits ensureDocumentIndexIsUpdated before resolving a definition, which is
+    // right for a rare user-initiated jump but wrong here: re-indexing costs a
+    // measured 1006-1974 ms on MATLAB's single thread, and hover fires on every
+    // mouse settle. Classification therefore reads whatever the index last had,
+    // and the document-sourced half of the card is always current.
+    constructor (
+        private readonly matlabLifecycleManager: MatlabLifecycleManager,
+        private readonly mvm: MVM,
+        private readonly fileInfoIndex: FileInfoIndex
+    ) {}
+
+    /**
+     * Drops the whole cache. Called when the MATLAB connection changes state,
+     * since a new session may have a different path, different shadowing and a
+     * different release.
+     */
+    clearCache (): void {
+        this.cache.clear()
+    }
+
+    /**
+     * Handles a textDocument/hover request.
+     *
+     * @param params Parameters from the onHover request
+     * @param documentManager The text document manager
+     * @param token Cancellation token supplied by the LSP connection
+     * @returns The hover card, or null when there is nothing useful to show
+     */
+    async handleHoverRequest (
+        params: HoverParams, documentManager: TextDocuments<TextDocument>, token?: CancellationToken
+    ): Promise<Hover | null> {
+        const uri = params.textDocument.uri
+        const doc = documentManager.get(uri)
+
+        if (doc == null) {
+            return null
+        }
+
+        const text = doc.getText()
+        const lines = text.split(/\r?\n/)
+        const { line, character } = params.position
+
+        // Gate on comments and strings first. Nothing downstream knows the
+        // difference, so without this a documentation card appears for the word
+        // `plot` inside `% remember to plot this`.
+        if (isInCommentOrString(lines, line, character)) {
+            return null
+        }
+
+        // Operators and punctuation resolve from a bundled table, so this path
+        // needs no index and no MATLAB. It is the only part of hover that works
+        // during the cold start.
+        const operatorHover = this.tryOperatorHover(lines, line, character)
+        if (operatorHover != null) {
+            return operatorHover
+        }
+
+        const expression = getExpressionAtPosition(doc, params.position)
+        if (expression == null) {
+            return null
+        }
+
+        // A keyword is a word, so the identifier scan finds it before the
+        // operator scan can.
+        const keywordEntry = getOperatorHelp(expression.unqualifiedTarget)
+        if (keywordEntry?.isKeyword === true) {
+            return this.toHover(this.renderKeywordCard(keywordEntry.topic, keywordEntry.text), null)
+        }
+
+        if (isCancelled(token)) {
+            return null
+        }
+
+        // Classify against the index where possible. When the file is not
+        // indexed (MATLAB down, cold start, or indexing disabled) this returns
+        // null and the dotted expression from the text is used instead, which is
+        // strictly less accurate but still useful.
+        const classified = this.classify(uri, params, documentManager)
+        const topic = classified?.targetExpression ?? expression.targetExpression
+        const hoverRange = classified != null ? classified.range.range : undefined
+
+        const offline = buildOfflineSymbolInfo(text, expression.unqualifiedTarget)
+
+        // Never run help() on something the index says is a variable.
+        if (classified?.classification === SymbolClassification.Variable) {
+            return this.toHover(
+                this.renderVariableCard(expression.unqualifiedTarget, text, expression.unqualifiedTarget),
+                hoverRange
+            )
+        }
+
+        const cacheKey = HoverCache.keyFor(topic, this.mvm.getMatlabRelease() ?? 'unknown')
+        const cached = this.cache.get(cacheKey)
+        if (cached !== undefined) {
+            return this.toHover(cached.markdown, hoverRange)
+        }
+
+        const hoverData = await this.retrieveHoverData(topic, token)
+
+        if (isCancelled(token)) {
+            return null
+        }
+
+        const markdown = this.renderSymbolCard(topic, hoverData, offline)
+
+        if (markdown === '') {
+            return null
+        }
+
+        // Only cache cards that came from a ready MATLAB. An offline-only card
+        // would otherwise be pinned for the rest of the session and never
+        // upgraded once MATLAB connects.
+        if (hoverData != null) {
+            this.cache.set(cacheKey, { markdown })
+        }
+
+        reportTelemetry(RequestType.Hover)
+
+        return this.toHover(markdown, hoverRange)
+    }
+
+    private classify (
+        uri: string, params: HoverParams, documentManager: TextDocuments<TextDocument>
+    ): ReturnType<typeof classifySymbolAtPosition> {
+        try {
+            return classifySymbolAtPosition(
+                uri, params.position, this.fileInfoIndex, documentManager, RequestType.Hover
+            )
+        } catch (err) {
+            Logger.error('Error caught while classifying hover target:')
+            Logger.error(err as string)
+            return null
+        }
+    }
+
+    private tryOperatorHover (lines: string[], line: number, character: number): Hover | null {
+        const lineText = lines[line]
+        if (lineText === undefined) {
+            return null
+        }
+
+        const match = findOperatorAtPosition(lineText, character)
+        if (match == null) {
+            return null
+        }
+
+        const entry = getOperatorHelp(match.topic)
+        if (entry == null) {
+            return null
+        }
+
+        return this.toHover(
+            this.renderKeywordCard(entry.topic, entry.text),
+            Range.create(line, match.start, line, match.end)
+        )
+    }
+
+    /**
+     * Retrieves raw hover data from MATLAB.
+     *
+     * Returns null rather than queueing when MATLAB is not ready. The MVM
+     * serializes fevals and offers neither timeout nor cancel, so a hover issued
+     * during a long-running user command would otherwise sit in that queue and
+     * arrive long after the pointer moved away.
+     *
+     * @param topic The resolved help topic
+     * @param token Cancellation token
+     * @returns The raw payload, or null if MATLAB is unavailable or errored
+     */
+    private async retrieveHoverData (topic: string, token?: CancellationToken): Promise<MHoverData | null> {
+        if (!this.mvm.isReady()) {
+            return null
+        }
+
+        if (isCancelled(token)) {
+            return null
+        }
+
+        try {
+            const response = await this.mvm.feval(
+                'matlabls.handlers.hover.getHoverData',
+                1,
+                [topic]
+            )
+
+            if ('error' in response) {
+                Logger.error('Error received while retrieving hover data:')
+                Logger.error(response.error.msg)
+                return null
+            }
+
+            return parse(response.result[0]) as MHoverData
+        } catch (err) {
+            Logger.error('Error caught while retrieving hover data:')
+            Logger.error(err as string)
+            return null
+        }
+    }
+
+    private renderKeywordCard (topic: string, text: string): string {
+        return ['**' + topic + '**', '', '```matlab', text, '```'].join('\n')
+    }
+
+    /**
+     * Renders the card for a variable.
+     *
+     * There is deliberately no help() content here. What the code itself says
+     * about the variable is the only sound static answer; a live value would
+     * reflect the last run rather than the buffer, so it belongs behind an
+     * explicit opt-in and an explicit staleness label, not here.
+     */
+    private renderVariableCard (name: string, documentText: string, symbolName: string): string {
+        const parts: string[] = ['**' + name + '**  ·  variable']
+
+        // An arguments block declaration is the richest static statement about a
+        // variable that MATLAB itself cannot give you.
+        const lines = documentText.split(/\r?\n/)
+        const enclosing = this.findEnclosingFunctionName(lines, symbolName)
+        if (enclosing != null) {
+            const info = buildOfflineSymbolInfo(documentText, enclosing)
+            const declaration = info?.argumentDeclarations.find(d => d.name === symbolName || d.name.startsWith(symbolName + '.'))
+            if (declaration != null) {
+                const rendered = renderArgumentsTable([declaration])
+                parts.push('', '```matlab', rendered, '```')
+                parts.push('', '_declared in an arguments block, line ' + String(declaration.line + 1) + '_')
+                return parts.join('\n')
+            }
+        }
+
+        parts.push('', '_local variable_')
+        return parts.join('\n')
+    }
+
+    private findEnclosingFunctionName (lines: string[], _symbolName: string): string | null {
+        // The index is the right oracle for scope, but this path runs when the
+        // file is not indexed. Fall back to the first function declaration,
+        // which is correct for the overwhelmingly common single-function file.
+        for (const line of lines) {
+            const match = /^\s*function\s+(?:\[[^\]]*\]\s*=\s*|[A-Za-z][A-Za-z0-9_]*\s*=\s*)?([A-Za-z][A-Za-z0-9_]*)/.exec(line)
+            if (match != null) {
+                return match[1]
+            }
+        }
+        return null
+    }
+
+    /**
+     * Composes the documentation card for a function, class or method.
+     *
+     * MATLAB-sourced content and document-sourced content are merged rather than
+     * treated as alternatives: help() cannot see an `arguments` block or an
+     * unsaved buffer, and the document cannot see a builtin.
+     */
+    private renderSymbolCard (topic: string, data: MHoverData | null, offline: OfflineSymbolInfo | null): string {
+        const parts: string[] = []
+
+        // Prefer the document's own H1, then MATLAB's. help() opens with
+        // " fft - Fast Fourier transform", which belongs on the title line
+        // rather than buried at the top of the body.
+        const helpSummary = extractHelpSummary(topic, data?.helpText)
+        const summary = offline?.summary ?? helpSummary
+        parts.push(summary != null && summary !== '' ? '**' + topic + '**  ·  ' + summary : '**' + topic + '**')
+
+        const signatures = this.normalizeSignatures(data, offline)
+        if (signatures.length > 0) {
+            parts.push('', '```matlab', signatures.join('\n'), '```')
+        }
+
+        const body = this.composeBody(data, offline, signatures.length > 0)
+        // Drop the summary line from the body when it was promoted above.
+        const trimmedBody = helpSummary != null ? stripLeadingSummaryLine(body, topic) : body
+        if (trimmedBody !== '') {
+            parts.push('', '```matlab', trimmedBody, '```')
+        }
+
+        const argumentsTable = offline != null ? renderArgumentsTable(offline.argumentDeclarations) : ''
+        if (argumentsTable !== '') {
+            parts.push('', '**Arguments**', '', '```matlab', argumentsTable, '```')
+        }
+
+        if (data?.shadowedBy != null && data.shadowedBy !== '') {
+            parts.push('', '⚠ Shadowed by `' + data.shadowedBy + '`')
+        }
+
+        // Only a real mathworks.com URL is worth rendering. getHelpPopupUrl also
+        // returns per-session https://127.0.0.1:<rotating port>/ URLs for user
+        // files and for licensed-but-not-installed toolboxes, and the .m handler
+        // filters those out before they reach here.
+        if (data?.docUrl != null && data.docUrl !== '') {
+            parts.push('', '[Documentation](' + data.docUrl + ')')
+        }
+
+        // Nothing but a bold name is not worth a tooltip. A name plus a summary
+        // is, which is why this tests for real content rather than for the
+        // number of parts: promoting the summary to the title line can leave the
+        // body empty while the card is still worth showing.
+        const hasSummary = summary != null && summary !== ''
+        if (!hasSummary && parts.length === 1) {
+            return ''
+        }
+
+        return parts.join('\n')
+    }
+
+    private normalizeSignatures (data: MHoverData | null, offline: OfflineSymbolInfo | null): string[] {
+        let signatures: string[] = []
+
+        if (data?.signatures != null) {
+            signatures = Array.isArray(data.signatures) ? data.signatures : [data.signatures]
+            signatures = signatures.filter(s => typeof s === 'string' && s.trim() !== '')
+            // MATLAB returns one entry per overload, and for keywords such as
+            // `end` those can be identical.
+            signatures = Array.from(new Set(signatures))
+        }
+
+        if (signatures.length === 0 && offline?.signature != null && offline.signature !== '') {
+            signatures = [offline.signature]
+        }
+
+        return signatures
+    }
+
+    /**
+     * Builds the prose body.
+     *
+     * The Syntax block is stripped when signatures were rendered above it,
+     * because help() repeats them verbatim there.
+     */
+    private composeBody (data: MHoverData | null, offline: OfflineSymbolInfo | null, signaturesRendered: boolean): string {
+        const helpText = data?.helpText
+        if (helpText != null && helpText.trim() !== '') {
+            return signaturesRendered ? stripSyntaxSection(helpText) : helpText
+        }
+
+        // No MATLAB content: fall back to what the document says. This is the
+        // path that serves unsaved buffers and local functions, which help()
+        // returns nothing for.
+        const offlineBody = offline?.body
+        if (offlineBody != null && offlineBody.trim() !== '') {
+            return offlineBody
+        }
+
+        return ''
+    }
+
+    private toHover (markdown: string, range: Range | null | undefined): Hover {
+        const hover: Hover = {
+            contents: {
+                kind: MarkupKind.Markdown,
+                value: markdown
+            }
+        }
+        if (range != null) {
+            hover.range = range
+        }
+        return hover
+    }
+}
+
+/**
+ * Reads a cancellation token.
+ *
+ * Kept as a free function so the compiler cannot narrow the property to `false`
+ * after the first check and then reject every later one as unreachable. The
+ * whole point of a token is that the value changes underneath us.
+ *
+ * @param token The token, which the connection may or may not supply
+ * @returns True when cancellation has been requested
+ */
+function isCancelled (token?: CancellationToken): boolean {
+    return token?.isCancellationRequested === true
+}
+
+/**
+ * Extracts MATLAB's one-line summary from help output.
+ *
+ * On R2026a the sectioned reference format opens with " fft - Fast Fourier
+ * transform". User files return their raw comment block instead and have no such
+ * line, so this must return null rather than guessing.
+ *
+ * The topic is matched against the leading name because a dotted topic
+ * ("MyClass.increment") reports only its last component there.
+ *
+ * @param topic The resolved help topic
+ * @param helpText The raw help text
+ * @returns The summary, or null when the help text does not open with one
+ */
+export function extractHelpSummary (topic: string, helpText: string | undefined): string | null {
+    if (helpText == null || helpText.trim() === '') {
+        return null
+    }
+
+    const firstLine = helpText.split('\n')[0].trim()
+    const lastComponent = topic.split('.').pop() ?? topic
+    const match = /^(\S+)\s+-\s+(.+)$/.exec(firstLine)
+
+    if (match == null) {
+        return null
+    }
+
+    if (match[1] !== topic && match[1] !== lastComponent) {
+        return null
+    }
+
+    return match[2].trim()
+}
+
+/**
+ * Removes the leading summary line from a help body once it has been promoted to
+ * the title line.
+ *
+ * @param body The help body
+ * @param topic The resolved help topic
+ * @returns The body without its summary line
+ */
+export function stripLeadingSummaryLine (body: string, topic: string): string {
+    if (body === '') {
+        return body
+    }
+
+    const lines = body.split('\n')
+    const lastComponent = topic.split('.').pop() ?? topic
+    const match = /^(\S+)\s+-\s+(.+)$/.exec(lines[0].trim())
+
+    if (match == null || (match[1] !== topic && match[1] !== lastComponent)) {
+        return body
+    }
+
+    const remaining = lines.slice(1)
+    while (remaining.length > 0 && remaining[0].trim() === '') {
+        remaining.shift()
+    }
+
+    return remaining.join('\n')
+}
+
+/**
+ * Removes the "Syntax" section from help output.
+ *
+ * R2026a returns a sectioned reference format for builtins but the raw leading
+ * comment block for user files, so this must tolerate the section being absent
+ * entirely rather than assuming either shape.
+ *
+ * @param helpText The raw help text
+ * @returns The text with its Syntax section removed
+ */
+export function stripSyntaxSection (helpText: string): string {
+    const lines = helpText.split('\n')
+    const start = lines.findIndex(line => line.trim() === 'Syntax')
+
+    if (start === -1) {
+        return helpText
+    }
+
+    const syntaxIndent = lines[start].length - lines[start].trimStart().length
+
+    let end = start + 1
+    while (end < lines.length) {
+        const line = lines[end]
+        if (line.trim() === '') {
+            end++
+            continue
+        }
+        const indent = line.length - line.trimStart().length
+        if (indent <= syntaxIndent) {
+            break
+        }
+        end++
+    }
+
+    const remaining = [...lines.slice(0, start), ...lines.slice(end)]
+
+    while (remaining.length > 0 && remaining[remaining.length - 1].trim() === '') {
+        remaining.pop()
+    }
+
+    return remaining.join('\n')
+}
+
+export default HoverSupportProvider

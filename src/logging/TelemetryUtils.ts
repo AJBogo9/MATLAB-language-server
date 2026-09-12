@@ -18,7 +18,8 @@ export enum Actions {
     GoToDefinition = 'goToDefinition',
     DocumentSymbol = 'documentSymbol',
     RenameSymbol = 'renameSymbol',
-    HighlightSymbol = 'highlightSymbol'
+    HighlightSymbol = 'highlightSymbol',
+    Hover = 'hover'
 }
 
 export enum ActionErrorConditions {

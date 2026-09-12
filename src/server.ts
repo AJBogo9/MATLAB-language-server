@@ -24,6 +24,7 @@ import Indexer from './indexing/Indexer'
 import RenameSymbolProvider from './providers/rename/RenameSymbolProvider'
 import HighlightSymbolProvider from './providers/highlighting/HighlightSymbolProvider'
 import SemanticTokensProvider, { SEMANTIC_TOKEN_TYPES, SEMANTIC_TOKEN_MODIFIERS, setupSemanticTokensRefresh } from './providers/semanticTokens/SemanticTokensProvider'
+import HoverSupportProvider from './providers/hover/HoverSupportProvider'
 import { RequestType } from './indexing/SymbolSearchService'
 import { cacheAndClearProxyEnvironmentVariables } from './utils/ProxyUtils'
 import MatlabDebugAdaptorServer from './debug/MatlabDebugAdaptorServer'
@@ -81,6 +82,7 @@ export async function startServer (): Promise<void> {
     const renameSymbolProvider = new RenameSymbolProvider(matlabLifecycleManager, documentIndexer, fileInfoIndex)
     const highlightSymbolProvider = new HighlightSymbolProvider(matlabLifecycleManager, documentIndexer, indexer, fileInfoIndex)
     const semanticTokensProvider = new SemanticTokensProvider(matlabLifecycleManager, documentIndexer, fileInfoIndex)
+    const hoverSupportProvider = new HoverSupportProvider(matlabLifecycleManager, mvm, fileInfoIndex)
 
     const projectEventNotifier = new ProjectEventNotifier(matlabLifecycleManager)
 
@@ -98,6 +100,10 @@ export async function startServer (): Promise<void> {
     })
 
     mvm.on(IMVM.Events.stateChange, (state: MatlabMVMConnectionState) => {
+        // Help text, signature lists, shadowing and documentation URLs are all
+        // session-specific, so a state change invalidates every cached card.
+        hoverSupportProvider.clearCache()
+
         if (state === MatlabMVMConnectionState.CONNECTED) {
             // Handle when the MVM has connected
             mvm.feval('matlabls.utils.startupHelper', 0, [])
@@ -142,6 +148,7 @@ export async function startServer (): Promise<void> {
                     commands: Object.values(MatlabLSCommands)
                 },
                 foldingRangeProvider: true,
+                hoverProvider: true,
                 referencesProvider: true,
                 signatureHelpProvider: {
                     triggerCharacters: ['(', ',']
@@ -374,6 +381,11 @@ export async function startServer (): Promise<void> {
 
     connection.onDocumentSymbol(async params => {
         return await navigationSupportProvider.handleDocumentSymbol(params.textDocument.uri, documentManager, RequestType.DocumentSymbol)
+    })
+
+    /** -------------------- HOVER SUPPORT -------------------- **/
+    connection.onHover(async (params, token) => {
+        return await hoverSupportProvider.handleHoverRequest(params, documentManager, token)
     })
 
     // Start listening to open/change/close text document events

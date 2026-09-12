@@ -19,7 +19,8 @@ export enum RequestType {
     References,
     DocumentSymbol,
     RenameSymbol,
-    DocumentHighlight
+    DocumentHighlight,
+    Hover
 }
 
 export function reportTelemetry (type: RequestType, errorCondition = ''): void {
@@ -39,6 +40,9 @@ export function reportTelemetry (type: RequestType, errorCondition = ''): void {
             break
         case RequestType.DocumentHighlight:
             action = Actions.HighlightSymbol
+            break
+        case RequestType.Hover:
+            action = Actions.Hover
             break
     }
     reportTelemetryAction(action, errorCondition)
@@ -226,6 +230,97 @@ export function findSelectedIdentifierComponent (
         return scopedId.id.components[scopedId.selectedComponentIndex]
     } else {
         return scopedId.id
+    }
+}
+
+/**
+ * How an identifier at a position is classified by the index.
+ */
+export enum SymbolClassification {
+    ClassReference = 'classReference',
+    Variable = 'variable',
+    FunctionOrUnbound = 'functionOrUnbound',
+    FunctionDeclaration = 'functionDeclaration',
+    PropertyDeclaration = 'propertyDeclaration'
+}
+
+export interface ClassifiedSymbol {
+    /** The named range of the selected component. */
+    range: NamedRange
+    /** What the index believes this identifier is. */
+    classification: SymbolClassification
+    /** The dotted expression up to and including the selected component, e.g. "pkg.Class". */
+    targetExpression: string
+}
+
+/**
+ * Finds and classifies the identifier at a position.
+ *
+ * findSelectedIdentifierComponent already computes this classification
+ * internally but discards it, returning only the range. Hover needs the
+ * classification itself, because running help() on a variable is actively
+ * harmful: MATLAB resolves unknown names to unrelated topics rather than
+ * failing. Verified on R2026a:
+ *
+ *   help('i')       -> " i - Imaginary unit"
+ *   help('idx')     -> "--- idx not found. Showing help for fix instead. ---"
+ *   help('x')       -> "--- x not found. Showing help for matlab.graphics.shape.Arrow/X ---"
+ *   help('data')    -> timeseries/Data
+ *   help('results') -> inputParser/Results
+ *
+ * Every one of those is a common MATLAB variable name, and resolveName's
+ * foundVar flag cannot rescue it: it was 0 for all 18 names tested, because the
+ * language server's MATLAB has no editor-local workspace.
+ *
+ * @param uri The URI of the document
+ * @param position The position in the document
+ * @param fileInfoIndex The file info index
+ * @param documentManager The document manager
+ * @param requestType The type of request being made (used for telemetry reporting)
+ * @returns The classified symbol, or null if there is no identifier at the position
+ */
+export function classifySymbolAtPosition (
+    uri: string, position: Position, fileInfoIndex: FileInfoIndex, documentManager: TextDocuments<TextDocument>,
+    requestType: RequestType
+): ClassifiedSymbol | null {
+    const result = getScopedIdAndCodeInfo(
+        uri, position, fileInfoIndex, documentManager, requestType
+    )
+
+    if (result == null) {
+        return null
+    }
+
+    const [scopedId] = result
+
+    if (scopedId instanceof ScopedVariableReference || scopedId instanceof ScopedFunctionOrUnboundReference) {
+        const components = scopedId.id.components
+        const selected = components[scopedId.selectedComponentIndex]
+        return {
+            range: selected,
+            classification: scopedId instanceof ScopedVariableReference
+                ? SymbolClassification.Variable
+                : SymbolClassification.FunctionOrUnbound,
+            targetExpression: components
+                .slice(0, scopedId.selectedComponentIndex + 1)
+                .map(component => component.name)
+                .join('.')
+        }
+    }
+
+    let classification: SymbolClassification
+    if (scopedId instanceof ClassReference) {
+        classification = SymbolClassification.ClassReference
+    } else if (scopedId instanceof ScopedFunctionDeclarationId) {
+        classification = SymbolClassification.FunctionDeclaration
+    } else {
+        classification = SymbolClassification.PropertyDeclaration
+    }
+
+    return {
+        range: scopedId.id,
+        classification,
+        targetExpression: scopedId.id.name
     }
 }
 
