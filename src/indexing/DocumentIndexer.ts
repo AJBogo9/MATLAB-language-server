@@ -31,7 +31,7 @@ export default class DocumentIndexer {
         this.pendingFilesToIndex.set(
             uri,
             setTimeout(() => {
-                this.indexDocument(textDocument)
+                void this.indexDocument(textDocument)
             }, INDEXING_DELAY) // Specify timeout for debouncing, to avoid re-indexing every keystroke while a user types
         )
     }
@@ -41,8 +41,21 @@ export default class DocumentIndexer {
      *
      * @param textDocument The document being indexed
      */
-    indexDocument (textDocument: TextDocument): void {
-        void this.indexer.indexDocument(textDocument)
+    async indexDocument (textDocument: TextDocument): Promise<void> {
+        // Drop the debounce entry now that indexing is actually happening.
+        // Without this the map keeps the URI forever, so the next
+        // ensureDocumentIndexIsUpdated sees the document as still pending and
+        // re-parses the whole file through MATLAB: a measured 1006-1974 ms on
+        // the single MATLAB thread, once per edit-then-navigate cycle.
+        // LintingSupportProvider already clears its own timer this way.
+        this.clearTimerForDocumentUri(textDocument.uri)
+
+        // Await before announcing. The previous `void` meant onIndexed fired
+        // while the parse was still in flight, so semantic highlighting rendered
+        // from a cache one edit behind. Both external callers already discard
+        // the result with `void`, so widening the return type is source
+        // compatible.
+        await this.indexer.indexDocument(textDocument)
         this.onIndexed?.(textDocument.uri)
     }
 
@@ -68,15 +81,26 @@ export default class DocumentIndexer {
      */
     async ensureDocumentIndexIsUpdated (textDocument: TextDocument): Promise<void> {
         const uri = textDocument.uri
+        let didIndex = false
+
         if (this.pendingFilesToIndex.has(uri)) {
             this.clearTimerForDocumentUri(uri)
             await this.indexer.indexDocument(textDocument)
+            didIndex = true
         }
         if (!this.fileInfoIndex.codeInfoCache.has(uri)) {
             await this.indexer.indexDocument(textDocument)
+            didIndex = true
         }
 
-        this.onIndexed?.(uri)
+        // Only announce a real re-index. This method is reached from
+        // HighlightSymbolProvider, which runs on every caret move, and
+        // onIndexed schedules a workspace-wide semanticTokens/refresh 150 ms
+        // later. Firing it unconditionally turned simply moving the cursor into
+        // a full workspace token refresh.
+        if (didIndex) {
+            this.onIndexed?.(uri)
+        }
     }
 
     setOnIndexed (callback: (uri: string) => void): void {
