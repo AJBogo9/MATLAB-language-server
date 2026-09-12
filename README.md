@@ -20,6 +20,8 @@ MATLAB language server implements several Language Server Protocol features and 
 * Code folding - [foldingRangeProvider](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_foldingRange)
 * Document highlights - [highlightSymbolProvider](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_documentHighlight)
 * Semantic tokens - [semanticTokensProvider](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_semanticTokens)
+* Hover information - [hoverProvider](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_hover)
+* Workspace symbol search - [workspaceSymbolProvider](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#workspace_symbol)
 
 ## Clients
 MATLAB language server supports these editors by installing the corresponding extension:

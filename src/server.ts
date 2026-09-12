@@ -25,6 +25,7 @@ import RenameSymbolProvider from './providers/rename/RenameSymbolProvider'
 import HighlightSymbolProvider from './providers/highlighting/HighlightSymbolProvider'
 import SemanticTokensProvider, { SEMANTIC_TOKEN_TYPES, SEMANTIC_TOKEN_MODIFIERS, setupSemanticTokensRefresh } from './providers/semanticTokens/SemanticTokensProvider'
 import HoverSupportProvider from './providers/hover/HoverSupportProvider'
+import WorkspaceSymbolProvider from './providers/navigation/WorkspaceSymbolProvider'
 import { RequestType } from './indexing/SymbolSearchService'
 import { cacheAndClearProxyEnvironmentVariables } from './utils/ProxyUtils'
 import MatlabDebugAdaptorServer from './debug/MatlabDebugAdaptorServer'
@@ -83,6 +84,7 @@ export async function startServer (): Promise<void> {
     const highlightSymbolProvider = new HighlightSymbolProvider(matlabLifecycleManager, documentIndexer, indexer, fileInfoIndex)
     const semanticTokensProvider = new SemanticTokensProvider(matlabLifecycleManager, documentIndexer, fileInfoIndex)
     const hoverSupportProvider = new HoverSupportProvider(matlabLifecycleManager, mvm, fileInfoIndex)
+    const workspaceSymbolProvider = new WorkspaceSymbolProvider(fileInfoIndex)
 
     const projectEventNotifier = new ProjectEventNotifier(matlabLifecycleManager)
 
@@ -154,6 +156,7 @@ export async function startServer (): Promise<void> {
                     triggerCharacters: ['(', ',']
                 },
                 documentSymbolProvider: true,
+                workspaceSymbolProvider: true,
                 renameProvider: {
                     prepareProvider: true
                 },
@@ -381,6 +384,10 @@ export async function startServer (): Promise<void> {
 
     connection.onDocumentSymbol(async params => {
         return await navigationSupportProvider.handleDocumentSymbol(params.textDocument.uri, documentManager, RequestType.DocumentSymbol)
+    })
+
+    connection.onWorkspaceSymbol(params => {
+        return workspaceSymbolProvider.handleWorkspaceSymbolRequest(params)
     })
 
     /** -------------------- HOVER SUPPORT -------------------- **/
