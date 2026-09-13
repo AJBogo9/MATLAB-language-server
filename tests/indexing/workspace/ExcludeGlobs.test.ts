@@ -247,7 +247,7 @@ describe('Workspace index exclusion globs', () => {
         // line break, which a trailing .* alone does not match.
         const table: Array<[string, string, boolean]> = [
             ['x/**/**', 'x', false], ['x/**/**', 'x/a', true], ['x/**/**', 'x/a/b.m', true], ['x/**/**', 'y/a', false], ['x/**/**', 'x/a\nb/c', true],
-            ['**/**', 'a', true], ['**/**', 'a/b/c.m', true], ['**/**', 'a\nb/c', true],
+            ['**/**', 'a', true], ['**/**', 'a/b/c.m', true],
             ['**/**/gen', 'gen', true], ['**/**/gen', 'a/gen', true], ['**/**/gen', 'a/b/gen', true], ['**/**/gen', 'gen2', false], ['**/**/gen', 'a/gen/b', false], ['**/**/gen', 'a\nb/gen', true],
             ['{**/**/gen,x}', 'gen', true], ['{**/**/gen,x}', 'a/b/gen', true], ['{**/**/gen,x}', 'x', true], ['{**/**/gen,x}', 'x/y', false], ['{**/**/gen,x}', 'y', false],
             ['x/**/**/z', 'x/z', true], ['x/**/**/z', 'x/a/z', true], ['x/**/**/z', 'x/a/b/z', true], ['x/**/**/z', 'x/a/b', false], ['x/**/**/z', 'z', false],
@@ -259,6 +259,27 @@ describe('Workspace index exclusion globs', () => {
             ['gen**', 'gen', true], ['gen**', 'gen2', true], ['gen**', 'x/gen', false], ['gen**', 'gen/a', false],
             ['***', 'a', true], ['***', 'a/b', false],
             ['*a**b*', 'ab', true], ['*a**b*', 'xaybz', true], ['*a**b*', 'a/b', false], ['*a**b*', 'b', false]
+        ]
+        for (const [glob, relativePath, expected] of table) {
+            assert.strictEqual(excludedBy(glob)(relativePath, !relativePath.endsWith('.m')), expected, `${glob} ~ ${JSON.stringify(relativePath)}`)
+        }
+    })
+
+    it('matches a glob or alternative of globstars alone as VS Code\'s glob does, not across a line break', () => {
+        // Expected values from VS Code 1.137's glob.parse, which reads globstars alone as .*, whether
+        // they are the whole key or one {a,b} alternative. In JavaScript . matches no line terminator
+        // (line feed, carriage return, U+2028, U+2029), so such a glob does not match a path with one
+        // in a name, while ** next to other segments does. The reviewers' tree showed this on folders
+        // whose names start or end with U+2028.
+        const table: Array<[string, string, boolean]> = [
+            ['{**/**}', 'gen/a.m', true], ['{**/**}', 'a/b/c.m', true], ['{**/**}', 'gen\u2028/a.m', false], ['{**/**}', '\u2028gen/a.m', false], ['{**/**}', 'a\nb/c.m', false],
+            ['{**/**/**}', 'x/y/a.m', true], ['{**/**/**}', 'gen\u2028/a.m', false], ['{**/**/**}', 'x/a\rb/c', false],
+            ['x/{**/**,y}', 'x/gen/a.m', true], ['x/{**/**,y}', 'x/y', true], ['x/{**/**,y}', 'x/gen\u2028/a.m', false], ['x/{**/**,y}', 'x/a\u2029b/c', false], ['x/{**/**,y}', 'y/a', false],
+            ['{**/**,x}/gen', 'a/b/gen', true], ['{**/**,x}/gen', 'x/gen', true], ['{**/**,x}/gen', 'a\nb/c/gen', false],
+            ['{x,**/**/}', 'a/b.m', true], ['{x,**/**/}', 'a\u2028b/c.m', false],
+            ['a{**/**}', 'a', true], ['a{**/**}', 'ab/c', true], ['a{**/**}', 'a\nb/c', false],
+            ['**/**', 'a/b/c.m', true], ['**/**', 'a\nb/c', false], ['**/**/**', 'a\u2028b/c.m', false], ['**/**/', 'a\u2029b/c.m', false],
+            ['{**,x}/gen', 'a\nb/gen', false], ['**/**/gen', 'a\nb/gen', true], ['{**/gen/**,x}', 'a\u2028/gen/b', true]
         ]
         for (const [glob, relativePath, expected] of table) {
             assert.strictEqual(excludedBy(glob)(relativePath, !relativePath.endsWith('.m')), expected, `${glob} ~ ${JSON.stringify(relativePath)}`)

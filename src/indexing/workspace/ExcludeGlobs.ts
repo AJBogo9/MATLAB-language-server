@@ -124,6 +124,11 @@ function globToRegExp (glob: string): RegExp {
 
 function translateGlob (glob: string): string {
     const segments = splitSegments(glob)
+    // Globstars alone read as .*, as in VS Code's glob, whether they are the whole key or one
+    // alternative. Unlike the group below, .* matches no name that holds a line break.
+    if (segments.every(segment => segment === '**')) {
+        return '.*'
+    }
     return segments.map((segment, index) => {
         const isLast = index === segments.length - 1
         if (segment === '**') {
