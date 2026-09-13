@@ -232,6 +232,40 @@ describe('HoverSupportProvider', () => {
             assert.ok(!text.includes('111'), 'must not show the first function\'s declaration')
         })
 
+        it('should show every name-value field of an options struct', async () => {
+            // Showing only the first made a three-field struct's card
+            // byte-identical to a one-field struct's.
+            setup([
+                'function y = f(x, opts)',
+                'arguments',
+                '    x double',
+                '    opts.Method (1,1) string = "lin"',
+                '    opts.Tol (1,1) double = 1e-6',
+                '    opts.MaxIter (1,1) double = 100',
+                'end',
+                'y = opts;',
+                'end'
+            ].join('\n'))
+            classifyAs(SymbolClassification.Variable, 'opts')
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(7, 4), documentManager))
+
+            assert.ok(text.includes('opts.Method'), 'every declared field should appear')
+            assert.ok(text.includes('opts.Tol'))
+            assert.ok(text.includes('opts.MaxIter'))
+            assert.ok(text.includes('lines 4-6'), 'and the footer should span them')
+        })
+
+        it('should not call a struct field access a local variable', async () => {
+            setup('y = opts.Method;')
+            classifyAs(SymbolClassification.Variable, 'opts')
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(0, 5), documentManager))
+
+            assert.ok(!text.includes('local variable'),
+                'the index classifies field access and method calls as variable references too')
+        })
+
         it('should show an arguments-block declaration for a validated parameter', async () => {
             setup([
                 'function y = f(x)',

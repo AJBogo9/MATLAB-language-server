@@ -60,8 +60,30 @@ function hoverData = getHoverData(topic)
             if ischar(allPaths)
                 allPaths = {allPaths};
             end
-            hoverData.whichPath = allPaths{1};
-            hoverData.shadowedBy = detectShadowing(allPaths);
+
+            % Drop this language server's own shadow stubs (edit, input, clc,
+            % restoredefaultpath). They are on the path by design, so leaving
+            % them in made the card show the stub's comment as the function's
+            % documentation and accuse the user of shadowing a builtin with a
+            % file the extension installed.
+            [allPaths, droppedOwnShadow] = filterServerShadows(allPaths);
+
+            if ~isempty(allPaths)
+                hoverData.whichPath = allPaths{1};
+                hoverData.shadowedBy = detectShadowing(allPaths);
+
+                % The help text came from the stub, so redo it against the real
+                % implementation.
+                if droppedOwnShadow && ~isNotFoundBanner
+                    try
+                        realHelp = help(allPaths{1});
+                        if ~isempty(strtrim(realHelp))
+                            [hoverData.helpText, hoverData.truncated] = truncateHelp(realHelp, MAX_LINES);
+                        end
+                    catch
+                    end
+                end
+            end
         end
     catch
     end
@@ -167,6 +189,24 @@ function shadowedBy = detectShadowing(allPaths)
             return;
         end
     end
+end
+
+function [kept, droppedOwnShadow] = filterServerShadows(allPaths)
+    % This file lives at <root>/matlab/+matlabls/+handlers/+hover/getHoverData.m,
+    % so four fileparts hops reach <root>/matlab, the folder added to the MATLAB
+    % path by MatlabSession and the parent of the shadows/ stubs.
+    serverMatlabRoot = fileparts(fileparts(fileparts(fileparts(mfilename('fullpath')))));
+
+    keepMask = true(1, numel(allPaths));
+    for k = 1:numel(allPaths)
+        entry = normalizeWhichEntry(allPaths{k});
+        if ~isempty(entry) && startsWith(entry, serverMatlabRoot)
+            keepMask(k) = false;
+        end
+    end
+
+    droppedOwnShadow = ~keepMask(1);
+    kept = allPaths(keepMask);
 end
 
 function p = normalizeWhichEntry(entry)

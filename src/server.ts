@@ -315,6 +315,12 @@ export async function startServer (): Promise<void> {
 
     // Handles files saved
     documentManager.onDidSave(params => {
+        // Documentation, signatures, shadowing and doc URLs can all change when a
+        // file is saved: a new function appears, a comment block is edited, or a
+        // new file starts shadowing a builtin. Without this, hover served
+        // pre-save content for the rest of the session.
+        hoverSupportProvider.clearCache()
+
         // Trigger any post-save operations
         if (mvm.isReady()) {
             const filePath = URI.parse(params.document.uri).fsPath

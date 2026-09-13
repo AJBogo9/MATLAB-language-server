@@ -106,6 +106,25 @@ describe('ArgumentsBlockParser', () => {
             assert.ok((declarations[0].validators ?? '').includes('mustBeReal'))
         })
 
+        it('should not let a transpose in a default swallow the trailing comment', () => {
+            // `[1 2]'` is a transpose. Treating its quote as a string opener ate
+            // the comment and, with an odd number of quotes, ran on into the
+            // next declaration.
+            const src = split([
+                'function f(x, y)',
+                'arguments',
+                "    x double = [1 2]'   % a transposed default",
+                '    y double = 3',
+                'end',
+                'end'
+            ].join('\n'))
+
+            const declarations = parseArgumentsBlocks(src, 0, src.length)
+            assert.equal(declarations.length, 2, 'the next declaration must survive')
+            assert.equal(declarations[0].defaultValue, "[1 2]'")
+            assert.equal(declarations[1].name, 'y')
+        })
+
         it('should skip comment-only and blank lines inside the block', () => {
             const src = split([
                 'function f(x)',

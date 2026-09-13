@@ -144,9 +144,12 @@ class HoverSupportProvider {
         const hoverRange = classified != null ? classified.range.range : undefined
 
         // A context-sensitive block keyword falls through to here. Answer it
-        // from the table only when the index has no opinion, which is the case
-        // for a genuine `arguments`/`properties` block header.
-        if (classified == null && keywordEntry?.isKeyword === true) {
+        // from the table only when the index has no opinion AND the token is
+        // actually opening a block. Offline the index has no opinion about
+        // anything, so without the shape check a variable or struct field named
+        // `properties` would get the builtin's card.
+        if (classified == null && keywordEntry?.isKeyword === true &&
+            isBlockKeywordUsage(lines[line], expression.unqualifiedTarget)) {
             return this.toHover(this.renderKeywordCard(keywordEntry.topic, keywordEntry.text), null)
         }
 
@@ -290,16 +293,31 @@ class HoverSupportProvider {
         const enclosing = this.findEnclosingFunctionName(lines, line)
         if (enclosing != null) {
             const info = buildOfflineSymbolInfo(documentText, enclosing)
-            const declaration = info?.argumentDeclarations.find(d => d.name === symbolName || d.name.startsWith(symbolName + '.'))
-            if (declaration != null) {
-                const rendered = renderArgumentsTable([declaration])
-                parts.push('', '```matlab', rendered, '```')
-                parts.push('', '_declared in an arguments block, line ' + String(declaration.line + 1) + '_')
+            // Every matching declaration, not just the first. An options struct
+            // declares one row per name-value field, and showing only one made
+            // a three-field struct's card byte-identical to a one-field struct's.
+            const declarations = info?.argumentDeclarations.filter(
+                d => d.name === symbolName || d.name.startsWith(symbolName + '.')
+            ) ?? []
+
+            if (declarations.length > 0) {
+                parts.push('', '```matlab', renderArgumentsTable(declarations), '```')
+
+                const first = declarations[0].line + 1
+                const last = declarations[declarations.length - 1].line + 1
+                parts.push('', declarations.length === 1
+                    ? '_declared in an arguments block, line ' + String(first) + '_'
+                    : '_name-value arguments, declared in an arguments block, lines ' +
+                      String(first) + '-' + String(last) + '_')
                 return parts.join('\n')
             }
         }
 
-        parts.push('', '_local variable_')
+        // Say only what is known. The index classified this as a variable
+        // reference, which also covers struct field access and method calls, so
+        // asserting "local variable" would be wrong for `opts.Method` and for
+        // `obj.doThing`.
+        parts.push('', '_no declaration found in this file_')
         return parts.join('\n')
     }
 
@@ -429,6 +447,32 @@ class HoverSupportProvider {
         }
         return hover
     }
+}
+
+/**
+ * True when the token opens a block or an import statement: it is the first
+ * non-whitespace token on its line and is not being used as an operand.
+ *
+ * @param lineText The line the token sits on
+ * @param name The token
+ * @returns Whether this looks like a block header rather than an identifier
+ */
+function isBlockKeywordUsage (lineText: string | undefined, name: string): boolean {
+    if (lineText === undefined) {
+        return false
+    }
+
+    const trimmed = lineText.trimStart()
+    if (!trimmed.startsWith(name)) {
+        return false
+    }
+
+    const rest = trimmed.slice(name.length).trimStart()
+
+    // A block header is bare, carries an attribute list, or ends in a comment.
+    // Anything that continues with an operator, a dot, an assignment or an
+    // index is the token being used as a value.
+    return rest === '' || rest.startsWith('(') || rest.startsWith('%')
 }
 
 /**

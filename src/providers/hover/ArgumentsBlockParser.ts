@@ -16,6 +16,8 @@
  * of a user-function hover card also works with MATLAB completely offline.
  */
 
+import { computeBlockCommentLines } from './CommentStringScanner'
+
 export type ArgumentKind = 'input' | 'output' | 'repeating'
 
 export interface ArgumentDeclaration {
@@ -84,9 +86,15 @@ function stripTrailingComment (line: string): string {
         }
 
         if (ch === "'") {
-            // Inside an arguments block a quote can only open a char array: a
-            // transpose would need a preceding value, and declarations start
-            // with an identifier followed by size/class/validators.
+            // A default value can contain a transpose, e.g. `x double = [1 2]'`.
+            // Treating every quote as a string opener swallowed the trailing
+            // comment and, with an odd number of quotes on the line, ran on into
+            // the next declaration. Same rule as the document scanner: MATLAB
+            // binds transpose tight, so the character immediately before decides.
+            const previous = i > 0 ? line[i - 1] : ''
+            if (/[A-Za-z0-9_)\]}.']/.test(previous)) {
+                continue
+            }
             inSingle = true
         } else if (ch === '"') {
             inDouble = true
@@ -255,13 +263,22 @@ function matchDelimiter (text: string, openIndex: number, open: string, close: s
  * @returns Every argument declaration found, in source order
  */
 export function parseArgumentsBlocks (
-    lines: string[], startLine: number, endLineExclusive: number
+    lines: string[], startLine: number, endLineExclusive: number, inBlockComment?: boolean[]
 ): ArgumentDeclaration[] {
     const declarations: ArgumentDeclaration[] = []
     const limit = Math.min(endLineExclusive, lines.length)
+    // Computed once by the caller where possible; testing per line is quadratic.
+    const commented = inBlockComment ?? computeBlockCommentLines(lines)
 
     let i = Math.max(0, startLine)
     while (i < limit) {
+        // An arguments block inside a %{ %} comment is commented out, so its
+        // declarations must not reach the Arguments table.
+        if (commented[i]) {
+            i++
+            continue
+        }
+
         const blockMatch = ARGUMENTS_BLOCK_START.exec(lines[i])
         if (blockMatch == null) {
             // An `arguments` block may only appear before any executable
@@ -343,6 +360,27 @@ export function renderArgumentsTable (declarations: ArgumentDeclaration[]): stri
         return ''
     }
 
+    // Group by kind so an `arguments (Output)` or `(Repeating)` block is not
+    // presented as an ordinary input under a heading that just says "Arguments".
+    const kinds: ArgumentKind[] = ['input', 'output', 'repeating']
+    const present = kinds.filter(kind => declarations.some(d => d.kind === kind))
+
+    if (present.length > 1) {
+        const labels: Record<ArgumentKind, string> = {
+            input: 'Input',
+            output: 'Output',
+            repeating: 'Repeating'
+        }
+        return present
+            .map(kind => labels[kind] + '\n' +
+                renderRows(declarations.filter(d => d.kind === kind)).split('\n').map(r => '  ' + r).join('\n'))
+            .join('\n')
+    }
+
+    return renderRows(declarations)
+}
+
+function renderRows (declarations: ArgumentDeclaration[]): string {
     const nameWidth = Math.max(...declarations.map(d => d.name.length))
     const rows = declarations.map(d => {
         const constraints = [d.size, d.className].filter(part => part != null && part !== '').join(' ')

@@ -97,42 +97,43 @@ export default class DocumentIndexer {
      */
     async ensureDocumentIndexIsUpdated (textDocument: TextDocument): Promise<void> {
         const uri = textDocument.uri
-        let didIndex = false
 
-        // Wait for a parse that is already running. Without this there is a
-        // window, from the moment the debounce fires until MATLAB answers, in
-        // which the document is neither pending nor cached-fresh, so this method
-        // returned immediately and the caller acted on the pre-edit index. That
-        // is how Run Section could execute the wrong lines after an edit.
-        const inFlight = this.inFlightParses.get(uri)
-        if (inFlight !== undefined) {
-            await inFlight.promise
-            if (inFlight.version < textDocument.version) {
-                // The document changed while that parse was running, and the
-                // parse captured its text before the change.
-                await this.indexer.indexDocument(textDocument)
-                didIndex = true
-            }
+        // Drain parses that are already running, re-reading the map after each
+        // await. The debounce timer can fire while we wait, and the parse it
+        // starts already covers the current text: holding a snapshot taken
+        // before the await made this issue a second full MATLAB parse of the
+        // same version, roughly doubling the latency of an edit-then-navigate
+        // cycle at the measured 1006-1974 ms parse cost.
+        let awaitedVersion = -1
+        let entry = this.inFlightParses.get(uri)
+        while (entry !== undefined) {
+            await entry.promise
+            awaitedVersion = Math.max(awaitedVersion, entry.version)
+            const next = this.inFlightParses.get(uri)
+            entry = next === entry ? undefined : next
         }
 
-        if (this.pendingFilesToIndex.has(uri)) {
-            this.clearTimerForDocumentUri(uri)
-            await this.indexer.indexDocument(textDocument)
-            didIndex = true
+        // One parse at most, chosen from three reasons to need one: the drained
+        // parse predates this document version, an edit is still queued, or the
+        // file has never been indexed.
+        const needsIndex =
+            (awaitedVersion >= 0 && awaitedVersion < textDocument.version) ||
+            this.pendingFilesToIndex.has(uri) ||
+            !this.fileInfoIndex.codeInfoCache.has(uri)
+
+        if (!needsIndex) {
+            return
         }
-        if (!this.fileInfoIndex.codeInfoCache.has(uri)) {
-            await this.indexer.indexDocument(textDocument)
-            didIndex = true
-        }
+
+        this.clearTimerForDocumentUri(uri)
+        await this.indexer.indexDocument(textDocument)
 
         // Only announce a real re-index. This method is reached from
         // HighlightSymbolProvider, which runs on every caret move, and
         // onIndexed schedules a workspace-wide semanticTokens/refresh 150 ms
         // later. Firing it unconditionally turned simply moving the cursor into
         // a full workspace token refresh.
-        if (didIndex) {
-            this.onIndexed?.(uri)
-        }
+        this.onIndexed?.(uri)
     }
 
     setOnIndexed (callback: (uri: string) => void): void {

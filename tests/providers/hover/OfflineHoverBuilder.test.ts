@@ -250,6 +250,73 @@ describe('OfflineHoverBuilder', () => {
             assert.equal(info?.summary, 'Summary line for the class.')
         })
 
+        it('should describe a function whose declaration wraps onto a second line', () => {
+            // `function [a, ...` does not match the single-line declaration form,
+            // so this function previously got no hover card at all.
+            const src = [
+                'function [a, ...',
+                '         b] = wrapped(z)',
+                '%WRAPPED Returns z twice.',
+                'a = z; b = z;',
+                'end'
+            ].join('\n')
+
+            const info = buildOfflineSymbolInfo(src, 'wrapped')
+            assert.ok(info != null, 'a continued declaration must still produce a card')
+            assert.equal(info.summary, 'Returns z twice.')
+        })
+
+        it('should not read an arguments block that is inside a block comment', () => {
+            const src = [
+                'function y = f(x)',
+                '%F Live function.',
+                '%{',
+                'arguments',
+                '    x double {mustBeCommentedOut}',
+                'end',
+                '%}',
+                'y = x;',
+                'end'
+            ].join('\n')
+
+            const info = buildOfflineSymbolInfo(src, 'f')
+            assert.deepEqual(info?.argumentDeclarations, [],
+                'commented-out declarations must not reach the Arguments table')
+        })
+
+        it('should stay linear on a large document', () => {
+            // The %{ %} guard originally rescanned from the top of the file for
+            // every line, which is quadratic: measured at 3.4 s of synchronous
+            // event-loop blocking per hover on a real 9371-line MATLAB file.
+            const build = (n: number): string => {
+                const body = ['function y = target(x)', '%TARGET The one we look up.', 'y = x;', 'end', '']
+                while (body.length < n) {
+                    body.push(`function z = filler${body.length}(a)`, 'z = a;', 'end', '')
+                }
+                return body.join('\n')
+            }
+
+            const small = build(500)
+            const large = build(8000)
+
+            const timeIt = (src: string): number => {
+                const started = process.hrtime.bigint()
+                buildOfflineSymbolInfo(src, 'target')
+                return Number(process.hrtime.bigint() - started) / 1e6
+            }
+
+            timeIt(small)  // warm up
+            const smallMs = timeIt(small)
+            const largeMs = timeIt(large)
+
+            // 16x the lines. Quadratic would be ~256x; linear is ~16x. Allow
+            // generous headroom for a loaded machine and still catch O(n^2).
+            assert.ok(largeMs < 400,
+                `hover on an 8000-line file took ${largeMs.toFixed(0)} ms, which blocks the event loop`)
+            assert.ok(largeMs < Math.max(smallMs, 1) * 80,
+                `scaling looks quadratic: ${smallMs.toFixed(2)} ms -> ${largeMs.toFixed(2)} ms`)
+        })
+
         it('should return null for a symbol not in the document', () => {
             assert.equal(buildOfflineSymbolInfo(AFTER_STYLE, 'somethingElse'), null)
         })

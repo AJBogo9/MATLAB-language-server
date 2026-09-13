@@ -1,7 +1,7 @@
 // Copyright 2026 Andreas Bogossian
 
 import { parseArgumentsBlocks, renderArgumentsTable, ArgumentDeclaration } from './ArgumentsBlockParser'
-import { isInsideBlockComment } from './CommentStringScanner'
+import { computeBlockCommentLines } from './CommentStringScanner'
 
 /**
  * Builds hover content for symbols declared in the document being viewed, using
@@ -60,27 +60,61 @@ const BLOCK_COMMENT_CLOSE = /^\s*%\}\s*$/
  * @returns The 0-based declaration line and its kind, or null if not declared here
  */
 export function findDeclarationLine (
-    lines: string[], name: string
+    lines: string[], name: string, inBlockComment?: boolean[]
 ): { line: number, kind: 'function' | 'classdef' } | null {
+    // Computed once per call. Testing each line independently rescans the
+    // document from the top every time, which is quadratic: measured at 3.4 s of
+    // synchronous blocking per hover on a real 9371-line file.
+    const commented = inBlockComment ?? computeBlockCommentLines(lines)
+
     for (let i = 0; i < lines.length; i++) {
         // A declaration written inside a %{ %} block is commented out. Treating
         // it as real hijacks the card and hides the live function's own
         // arguments block.
-        if (isInsideBlockComment(lines, i)) {
+        if (commented[i]) {
             continue
         }
 
-        const functionMatch = FUNCTION_DECLARATION.exec(lines[i])
+        if (!ANY_SCOPE_START.test(lines[i])) {
+            continue
+        }
+
+        // Join continuations before matching. `function [a, ...` does not match
+        // the single-line form, and without this such a function got no hover
+        // card at all.
+        const declaration = joinContinuations(lines, i).text
+
+        const functionMatch = FUNCTION_DECLARATION.exec(declaration)
         if (functionMatch != null && functionMatch[1] === name) {
             return { line: i, kind: 'function' }
         }
 
-        const classMatch = CLASSDEF_DECLARATION.exec(lines[i])
+        const classMatch = CLASSDEF_DECLARATION.exec(declaration)
         if (classMatch != null && classMatch[1] === name) {
             return { line: i, kind: 'classdef' }
         }
     }
     return null
+}
+
+/**
+ * Joins a logical line that continues across physical lines with `...`.
+ *
+ * @param lines The document split into lines
+ * @param start The 0-based first physical line
+ * @returns The joined text and the last physical line consumed
+ */
+function joinContinuations (lines: string[], start: number): { text: string, endLine: number } {
+    let text = lines[start] ?? ''
+    let i = start
+
+    while (/\.\.\.\s*$/.test(text.trimEnd()) && i + 1 < lines.length) {
+        text = text.trimEnd().replace(/\.\.\.$/, ' ')
+        i++
+        text += lines[i]
+    }
+
+    return { text, endLine: i }
 }
 
 /**
@@ -96,7 +130,13 @@ export function findDeclarationLine (
  * @returns The comment lines with their leading % stripped, in source order
  */
 export function extractDocComment (lines: string[], declarationLine: number): string[] {
-    const after = collectCommentBlockForward(lines, declarationLine + 1)
+    // A declaration continued with `...` spans several physical lines, and the
+    // help block follows the last of them. Starting at declarationLine + 1 found
+    // the continuation itself, which is not a comment, so such a function got no
+    // documentation at all.
+    const declarationEnd = joinContinuations(lines, declarationLine).endLine
+
+    const after = collectCommentBlockForward(lines, declarationEnd + 1)
     if (after.length > 0) {
         return after
     }
@@ -174,9 +214,9 @@ function trimBlankEdges (lines: string[]): string[] {
  * @param declarationLine The 0-based declaration line
  * @returns The 0-based exclusive end line
  */
-function findScopeEnd (lines: string[], declarationLine: number): number {
+function findScopeEnd (lines: string[], declarationLine: number, commented: boolean[]): number {
     for (let i = declarationLine + 1; i < lines.length; i++) {
-        if (isInsideBlockComment(lines, i)) {
+        if (commented[i]) {
             continue
         }
         if (ANY_SCOPE_START.test(lines[i])) {
@@ -222,7 +262,8 @@ export function extractSignature (lines: string[], declarationLine: number): str
  */
 export function buildOfflineSymbolInfo (documentText: string, name: string): OfflineSymbolInfo | null {
     const lines = documentText.split(/\r?\n/)
-    const declaration = findDeclarationLine(lines, name)
+    const commented = computeBlockCommentLines(lines)
+    const declaration = findDeclarationLine(lines, name, commented)
 
     if (declaration == null) {
         return null
@@ -252,7 +293,7 @@ export function buildOfflineSymbolInfo (documentText: string, name: string): Off
     }
 
     const argumentDeclarations = declaration.kind === 'function'
-        ? parseArgumentsBlocks(lines, declaration.line, findScopeEnd(lines, declaration.line))
+        ? parseArgumentsBlocks(lines, declaration.line, findScopeEnd(lines, declaration.line, commented), commented)
         : []
 
     return {
