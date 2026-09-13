@@ -5,12 +5,19 @@ import { EventEmitter } from 'events'
 import ConfigurationManager, { Argument, ConnectionTiming } from './ConfigurationManager'
 import { MatlabConnection } from './MatlabCommunicationManager'
 import MatlabSession, { launchNewMatlab, connectToMatlab } from './MatlabSession'
+import WorkspaceTrust from './WorkspaceTrust'
 
 export default class MatlabLifecycleManager {
     eventEmitter = new EventEmitter()
 
     private matlabSession: MatlabSession | null = null
     private connectionPromise: Promise<MatlabSession> | null = null
+
+    /**
+     * @param workspaceTrust Whether the workspace is trusted. A client that gives no trust
+     * state, such as another editor, is trusted.
+     */
+    constructor (private readonly workspaceTrust: WorkspaceTrust = new WorkspaceTrust()) {}
 
     /**
      * Gets the current connection to MATLAB.
@@ -61,6 +68,12 @@ export default class MatlabLifecycleManager {
      * @returns The active MATLAB session
      */
     async connectToMatlab (): Promise<MatlabSession> {
+        // MATLAB runs code from the workspace folders as it starts, so every launch and
+        // attach waits for the user to trust them
+        if (!this.workspaceTrust.isTrusted()) {
+            throw new Error('MATLAB does not start in an untrusted workspace')
+        }
+
         // If MATLAB is already connected, do not try to connect again
         if (this.matlabSession != null) {
             return this.matlabSession

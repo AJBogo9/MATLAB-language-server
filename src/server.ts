@@ -7,6 +7,7 @@ import WorkspaceIndexer from './indexing/WorkspaceIndexer'
 import ClientCapabilitiesManager from './lifecycle/ClientCapabilitiesManager'
 import ConfigurationManager, { ConnectionTiming } from './lifecycle/ConfigurationManager'
 import MatlabLifecycleManager from './lifecycle/MatlabLifecycleManager'
+import WorkspaceTrust from './lifecycle/WorkspaceTrust'
 import Logger from './logging/Logger'
 import { Actions, reportTelemetryAction } from './logging/TelemetryUtils'
 import NotificationService, { Notification } from './notifications/NotificationService'
@@ -54,7 +55,8 @@ export async function startServer (): Promise<void> {
     Logger.initialize(connection.console)
 
     // Instantiate services
-    const matlabLifecycleManager = new MatlabLifecycleManager()
+    const workspaceTrust = new WorkspaceTrust()
+    const matlabLifecycleManager = new MatlabLifecycleManager(workspaceTrust)
 
     const mvm = new MVM(matlabLifecycleManager, Logger);
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -128,6 +130,7 @@ export async function startServer (): Promise<void> {
     // Handles an initialization request
     connection.onInitialize((params: InitializeParams) => {
         ClientCapabilitiesManager.initialize(params.capabilities)
+        workspaceTrust.initialize(params.initializationOptions)
 
         // Defines the capabilities supported by this language server
         const initResult: InitializeResult = {
@@ -224,6 +227,11 @@ export async function startServer (): Promise<void> {
     })
 
     async function startMatlabIfOnStartLaunch (): Promise<void> {
+        if (!workspaceTrust.isTrusted()) {
+            Logger.log('MATLAB is not started until the workspace is trusted')
+            return
+        }
+
         // Launch MATLAB if it should be launched early
         const connectionTiming = (await ConfigurationManager.getConfiguration()).matlabConnectionTiming
         if (connectionTiming === ConnectionTiming.OnStart) {
@@ -244,6 +252,13 @@ export async function startServer (): Promise<void> {
             stopLicensingServer();
         }
     })
+
+    // A workspace trusted after the server started gets the connection timing it would have had
+    workspaceTrust.onGranted(() => { void startMatlabIfOnStartLaunch() })
+    NotificationService.registerNotificationListener(
+        Notification.WorkspaceTrustGranted,
+        () => workspaceTrust.grant()
+    )
 
     interface MatlabConnectionStatusParam {
         connectionAction: 'connect' | 'disconnect'
@@ -276,6 +291,8 @@ export async function startServer (): Promise<void> {
             hasMatlabBeenRequested = true;
             const matlabConnection = await matlabLifecycleManager.getMatlabConnection(true);
             if (matlabConnection === null) {
+                // Let a later request try again, such as one made after the workspace is trusted
+                hasMatlabBeenRequested = false
                 LifecycleNotificationHelper.notifyMatlabRequirement()
             }
         }

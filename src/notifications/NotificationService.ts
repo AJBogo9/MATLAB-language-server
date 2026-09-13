@@ -8,6 +8,9 @@ export enum Notification {
     MatlabConnectionClientUpdate = 'matlab/connection/update/client',
     MatlabConnectionServerUpdate = 'matlab/connection/update/server',
 
+    // Workspace Trust
+    WorkspaceTrustGranted = 'matlab/workspaceTrust/granted',
+
     // Errors
     MatlabLaunchFailed = 'matlab/launchfailed',
     MatlabFeatureUnavailable = 'feature/needsmatlab',
