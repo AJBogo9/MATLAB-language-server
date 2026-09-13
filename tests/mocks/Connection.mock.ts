@@ -9,7 +9,8 @@ export default function getMockConnection (): any {
             info: sinon.stub(),
             log: sinon.stub()
         },
-        sendNotification: sinon.stub()
+        sendNotification: sinon.stub(),
+        sendDiagnostics: sinon.stub()
     }
 
     return mockConnection

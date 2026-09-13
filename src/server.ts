@@ -332,9 +332,10 @@ export async function startServer (): Promise<void> {
 
     // Handles changes to the text document
     documentManager.onDidChangeContent(params => {
+        // Lint every edit. Without MATLAB the buffer is linted with the mlint executable.
+        lintingSupportProvider.queueLintingForDocument(params.document)
+
         if (matlabLifecycleManager.isMatlabConnected()) {
-            // Only want to lint on content changes when linting is being backed by MATLAB
-            lintingSupportProvider.queueLintingForDocument(params.document)
             documentIndexer.queueIndexingForDocument(params.document)
         }
     })

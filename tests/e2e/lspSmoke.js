@@ -147,6 +147,26 @@ const firstLine = hover => {
     return value.split('\n')[0]
 }
 
+// Polls the recorded notifications until the newest publishDiagnostics for uri
+// satisfies predicate. Returns that newest list, or null if none arrived.
+async function latestDiagnostics (uri, predicate, timeoutMs) {
+    const deadline = Date.now() + timeoutMs
+    let latest = null
+    for (;;) {
+        const pushes = notifications.filter(n =>
+            n.method === 'textDocument/publishDiagnostics' && n.params.uri === uri)
+        if (pushes.length > 0) {
+            latest = pushes[pushes.length - 1].params.diagnostics
+            if (predicate(latest)) return latest
+        }
+        if (Date.now() > deadline) return latest
+        await sleep(100)
+    }
+}
+
+const diagnosticCodes = diagnostics =>
+    diagnostics == null ? '(no publish)' : (diagnostics.map(d => d.code).join(',') || '(empty)')
+
 async function main () {
     const init = await request('initialize', {
         processId: process.pid,
@@ -230,6 +250,33 @@ async function main () {
         check('arguments table appears', own.contents.value.includes('mustBeFinite'),
             own.contents.value.includes('mustBeFinite') ? 'present' : own.contents.value.slice(0, 120))
     }
+
+    // Diagnostics come from the buffer being edited, with or without MATLAB. The
+    // file is absent on disk, so a linter that reads the saved file finds nothing.
+    const LINT_URI = 'file:///tmp/lintSmokeAbsentDir/lintSmoke.m'
+    const hasCode = code => diagnostics => diagnostics.some(d => d.code === code)
+    notify('textDocument/didOpen', {
+        textDocument: {
+            uri: LINT_URI,
+            languageId: 'matlab',
+            version: 1,
+            text: 'function y = lintSmoke(x)\ny = x + 1\nend\n'
+        }
+    })
+    const opened = await latestDiagnostics(LINT_URI, hasCode('NOPRT'), 8000)
+    check('diagnostics lint the open buffer, not the file on disk',
+        opened != null && hasCode('NOPRT')(opened), diagnosticCodes(opened))
+    check('the buffer is linted under its own file name',
+        opened != null && hasCode('NOPRT')(opened) && !hasCode('BDFIL')(opened) && !hasCode('FNDEF')(opened),
+        diagnosticCodes(opened))
+
+    notify('textDocument/didChange', {
+        textDocument: { uri: LINT_URI, version: 2 },
+        contentChanges: [{ text: 'function y = lintSmoke(x)\ny = (x + 1\nend\n' }]
+    })
+    const edited = await latestDiagnostics(LINT_URI, hasCode('EOLPAR'), 8000)
+    check('an edit is re-linted without a save',
+        edited != null && hasCode('EOLPAR')(edited), diagnosticCodes(edited))
 
     if (USE_MATLAB) {
         // A char array preceded by whitespace must still suppress hover. This is

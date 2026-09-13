@@ -7,6 +7,7 @@ import ConfigurationManager from '../../lifecycle/ConfigurationManager'
 import MatlabLifecycleManager from '../../lifecycle/MatlabLifecycleManager'
 import Logger from '../../logging/Logger'
 import * as fs from 'fs/promises'
+import * as os from 'os'
 import * as path from 'path'
 import which = require('which')
 import { MatlabLSCommands } from '../lspCommands/ExecuteCommandProvider'
@@ -19,6 +20,14 @@ type mlintSeverity = '0' | '1' | '2' | '3' | '4'
 
 const LINT_DELAY = 500 // Delay (in ms) after keystroke before attempting to lint the document
 
+// mlint writes its report to stderr. Past Node's default 1 MB cap, execFile fails and
+// the whole report is lost, so allow far more than a real file produces.
+const MLINT_MAX_BUFFER = 64 * 1024 * 1024
+
+// mlint applies this settings file from the linted file's folder and from every parent
+// folder, merged, so a copy of the buffer must carry them along.
+const CODE_ANALYZER_CONFIG = path.join('resources', 'codeAnalyzerConfiguration.json')
+
 // Lint result parsing constants
 const LINT_MESSAGE_REGEX = /L (\d+) \(C (\d+)-?(\d*)\): ([\dA-Za-z]+): ML(\d): (.*)/
 const FIX_FLAG_REGEX = /\(CAN FIX\)/
@@ -30,8 +39,8 @@ const FIX_CHANGE_REGEX = /----CHANGE MESSAGE L (\d+) \(C (\d+)\);\s+L (\d+) \(C 
  * Currently, this handles displaying diagnostics, providing quick-fixes,
  * and suppressing diagnostics.
  *
- * Note: When MATLAB® is not connected, diagnostics are only updated when
- * the file is saved and suppressing warnings is not available.
+ * Note: When MATLAB® is not ready, the buffer is linted with the mlint
+ * executable instead, and suppressing warnings is not available.
  */
 class LintingSupportProvider {
     private readonly SEVERITY_MAP = {
@@ -44,6 +53,10 @@ class LintingSupportProvider {
 
     private readonly _pendingFilesToLint = new Map<string, NodeJS.Timeout>()
     private readonly _availableCodeActions = new Map<string, CodeAction[]>()
+
+    // The newest lint started for each document. An older lint that finishes later is dropped.
+    private readonly _latestLintGeneration = new Map<string, number>()
+    private _lintGenerationCounter = 0
 
     constructor (private readonly matlabLifecycleManager: MatlabLifecycleManager, private readonly mvm: MVM) {}
 
@@ -76,26 +89,43 @@ class LintingSupportProvider {
         this.clearTimerForDocumentUri(uri)
         this.clearCodeActionsForDocumentUri(uri)
 
-        const matlabConnection = await this.matlabLifecycleManager.getMatlabConnection()
-        const isMatlabAvailable = matlabConnection != null
+        // Text documents are updated in place, so record what this lint describes before
+        // the first await. Its result is used only if no newer lint has started and the
+        // document has not changed since.
+        const version = textDocument.version
+        const generation = ++this._lintGenerationCounter
+        this._latestLintGeneration.set(uri, generation)
+        const isCurrent = (): boolean =>
+            this._latestLintGeneration.get(uri) === generation && textDocument.version === version
+
+        // Decide synchronously. Awaiting the MATLAB connection would stall every lint for
+        // the whole launch, and a connection exists well before the MVM can answer.
+        const isMatlabReady = this.mvm.isReady()
 
         const fileName = FileNameUtils.getFilePathFromUri(uri, true)
 
-        let lintData: string[] = []
+        let lintData: string[] | null = []
         const code = textDocument.getText()
 
         const analysisLimit = (await ConfigurationManager.getConfiguration()).maxFileSizeForAnalysis
         if (analysisLimit > 0 && code.length > analysisLimit) {
-            this.clearDiagnosticsForDocument(textDocument) // Clear document to handle setting changing value
+            if (isCurrent()) {
+                this.publishEmptyDiagnostics(uri) // Clear document to handle setting changing value
+            }
             return
         }
 
-        if (isMatlabAvailable) {
+        if (isMatlabReady) {
             // Use MATLAB-based linting for better results and fixes
             lintData = await this.getLintResultsFromMatlab(code, fileName)
         } else if (FileNameUtils.isMFile(uri)) {
-            // Try to use mlint executable for basic linting
-            lintData = await this.getLintResultsFromExecutable(fileName)
+            // Lint the buffer with the mlint executable
+            lintData = await this.getLintResultsFromExecutable(code, fileName)
+        }
+
+        if (!isCurrent() || lintData == null) {
+            // Superseded, or the lint failed: an empty list would claim the file is clean
+            return
         }
 
         const lintResults = this.processLintResults(uri, lintData)
@@ -111,9 +141,23 @@ class LintingSupportProvider {
         })
     }
 
+    /**
+     * Clears the diagnostics of a document that was closed. A lint still waiting for the
+     * typing pause is cancelled, and a lint already running is not published.
+     *
+     * @param textDocument The closed document
+     */
     clearDiagnosticsForDocument (textDocument: TextDocument): void {
+        const uri = textDocument.uri
+        this.clearTimerForDocumentUri(uri)
+        this._latestLintGeneration.delete(uri)
+        this.clearCodeActionsForDocumentUri(uri)
+        this.publishEmptyDiagnostics(uri)
+    }
+
+    private publishEmptyDiagnostics (uri: string): void {
         void ClientConnection.getConnection().sendDiagnostics({
-            uri: textDocument.uri,
+            uri,
             diagnostics: []
         })
     }
@@ -138,8 +182,8 @@ class LintingSupportProvider {
             return params.context.diagnostics.some(diag => this.isSameDiagnostic(diagnostic, diag))
         })
 
-        if (!this.matlabLifecycleManager.isMatlabConnected()) {
-            // Cannot suppress warnings without MATLAB
+        if (!this.mvm.isReady()) {
+            // Suppression runs in MATLAB, so offering it before the MVM can answer does nothing
             return codeActions
         }
 
@@ -294,12 +338,17 @@ class LintingSupportProvider {
     }
 
     /**
-     * Gets raw linting data using the mlint executable.
+     * Gets raw linting data for the buffer using the mlint executable.
      *
-     * @param fileName The file's name
-     * @returns Raw lint data for the file
+     * The buffer is written to a fresh temporary folder under the document's own file
+     * name. mlint takes the function name from the file name, so any other name makes it
+     * report BDFIL, or offer an FNDEF fix that renames the user's function to the temp name.
+     *
+     * @param code The code to be linted
+     * @param fileName The document's file name
+     * @returns Raw lint data for the code, or null if mlint could not lint it
      */
-    private async getLintResultsFromExecutable (fileName: string): Promise<string[]> {
+    private async getLintResultsFromExecutable (code: string, fileName: string): Promise<string[] | null> {
         const mlintExecutable = await this.getMlintExecutable()
 
         if (mlintExecutable == null) {
@@ -307,30 +356,89 @@ class LintingSupportProvider {
             return []
         }
 
-        const mlintArgs = [
-            fileName,
-            '-id',
-            '-severity',
-            '-fix'
-        ]
+        let tempDir: string | undefined
+        try {
+            tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'matlabls-lint-'))
+            const tempFile = await this.writeLintCopy(tempDir, code, fileName)
 
-        return await new Promise<string[]>(resolve => {
-            try {
-                execFile(
-                    mlintExecutable,
-                    mlintArgs,
-                    (error: ExecFileException | null, stdout: string, stderr: string) => {
-                        if (error != null) {
-                            Logger.error(`Error from mlint executable: ${error.message}\n${error.stack ?? ''}`)
-                            resolve([])
+            const mlintArgs = [
+                tempFile,
+                '-id',
+                '-severity',
+                '-fix'
+            ]
+
+            return await new Promise<string[] | null>(resolve => {
+                try {
+                    execFile(
+                        mlintExecutable,
+                        mlintArgs,
+                        { maxBuffer: MLINT_MAX_BUFFER },
+                        (error: ExecFileException | null, stdout: string, stderr: string) => {
+                            if (error != null) {
+                                // Includes an invalid project settings file, which makes mlint exit 255
+                                Logger.error(`Error from mlint executable: ${error.message}\n${error.stack ?? ''}`)
+                                resolve(null)
+                                return
+                            }
+                            resolve(stderr.split('\n')) // For some reason, mlint appears to output on stderr instead of stdout
                         }
-                        resolve(stderr.split('\n')) // For some reason, mlint appears to output on stderr instead of stdout
-                    }
-                )
-            } catch (e) {
-                Logger.error(`Error executing mlint executable at ${mlintExecutable}`)
+                    )
+                } catch (e) {
+                    Logger.error(`Error executing mlint executable at ${mlintExecutable}`)
+                    resolve(null)
+                }
+            })
+        } catch (err) {
+            Logger.error(`Error linting with the mlint executable: ${String(err)}`)
+            return null
+        } finally {
+            if (tempDir !== undefined) {
+                await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined)
             }
-        })
+        }
+    }
+
+    /**
+     * Writes the buffer into the temporary folder, together with every Code Analyzer
+     * settings file that applies to the original. Each settings file keeps its folder
+     * level relative to the document, so mlint merges them exactly as for the original.
+     *
+     * @param tempDir The temporary folder
+     * @param code The code to be linted
+     * @param fileName The document's file name
+     * @returns The path of the copy to lint
+     */
+    private async writeLintCopy (tempDir: string, code: string, fileName: string): Promise<string> {
+        const fileFolder = path.dirname(fileName)
+
+        // Every folder from the document's own up to the root that holds a settings file
+        const configFolders: string[] = []
+        for (let folder = fileFolder; ; folder = path.dirname(folder)) {
+            try {
+                await fs.access(path.join(folder, CODE_ANALYZER_CONFIG))
+                configFolders.push(folder)
+            } catch {
+                // No settings at this level
+            }
+            if (path.dirname(folder) === folder) {
+                break
+            }
+        }
+
+        // Mirror the folders below the outermost settings file
+        const mirrorRoot = configFolders.length > 0 ? configFolders[configFolders.length - 1] : fileFolder
+        for (const folder of configFolders) {
+            const target = path.join(tempDir, path.relative(mirrorRoot, folder), CODE_ANALYZER_CONFIG)
+            await fs.mkdir(path.dirname(target), { recursive: true })
+            await fs.copyFile(path.join(folder, CODE_ANALYZER_CONFIG), target)
+        }
+
+        const tempFolder = path.join(tempDir, path.relative(mirrorRoot, fileFolder))
+        await fs.mkdir(tempFolder, { recursive: true })
+        const tempFile = path.join(tempFolder, path.basename(fileName))
+        await fs.writeFile(tempFile, code)
+        return tempFile
     }
 
     /**
