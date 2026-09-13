@@ -275,6 +275,63 @@ describe('CompletionSupportProvider', () => {
             assert.ok(labels.includes('mapreduce'))
         })
 
+        it('should rank argument-specific keys ahead of the shared globals', async () => {
+            // sortText is stamped from insertion order. Gathering the shared
+            // block first buried the keys MATLAB computed for the argument the
+            // cursor is in: for plot(x,y,M the six Marker keys landed at
+            // positions 344-349 of 350, so the user had to scroll past every
+            // unrelated global function.
+            const globals = Array.from({ length: 50 }, (_, i) => ({
+                completion: `global${String(i).padStart(3, '0')}`, matchType: 'mFile', purpose: 'a global'
+            }))
+
+            const list = await completionsFor({
+                signatures: [{
+                    functionName: 'plot',
+                    promotion: 'suggested',
+                    inputArguments: [
+                        arg('X'),
+                        { name: 'Name', widgetType: 'completion', status: 'presenting', widgetData: { choices: [
+                            { completion: 'Marker', matchType: 'fieldname', purpose: 'name-value key' },
+                            { completion: 'MarkerSize', matchType: 'fieldname', purpose: 'name-value key' }
+                        ] } }
+                    ]
+                }],
+                shared: { widgetData: { choices: globals } }
+            })
+
+            const labels = list.items.map((i: any) => i.label)
+            assert.equal(labels[0], 'Marker', 'the argument-specific key must sort first')
+            assert.equal(labels[1], 'MarkerSize')
+            assert.equal(labels.length, 52, 'and every global is still offered')
+
+            // VS Code orders strictly by sortText, so assert on that too.
+            const sorted = [...list.items].sort((a: any, b: any) => a.sortText.localeCompare(b.sortText))
+            assert.equal(sorted[0].label, 'Marker')
+        })
+
+        it('should let a per-argument entry win a name collision with a global', async () => {
+            const list = await completionsFor({
+                signatures: [{
+                    functionName: 'f',
+                    promotion: 'suggested',
+                    inputArguments: [
+                        { name: 'opts', widgetType: 'completion', status: 'presenting', widgetData: { choices: [
+                            { completion: 'Method', matchType: 'fieldname', purpose: 'name-value key' }
+                        ] } }
+                    ]
+                }],
+                shared: { widgetData: { choices: [
+                    { completion: 'Method', matchType: 'mFile', purpose: 'a global function' }
+                ] } }
+            })
+
+            const method = list.items.find((i: any) => i.label === 'Method')
+            assert.equal(method.detail, 'name-value key',
+                'the argument-specific meaning must survive the shared merge')
+            assert.equal(list.items.filter((i: any) => i.label === 'Method').length, 1)
+        })
+
         it('should not break when there is no shared block', async () => {
             const list = await completionsFor({
                 widgetData: { choices: [{ completion: 'zeros', matchType: 'mFile', purpose: 'Create array of all zeros' }] }

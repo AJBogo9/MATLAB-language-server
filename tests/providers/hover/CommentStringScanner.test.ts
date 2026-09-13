@@ -41,6 +41,35 @@ describe('CommentStringScanner', () => {
             assert.equal(contextAt(line, 5), TokenContext.Code)
         })
 
+        it('should treat a quote separated by whitespace as a char array, not transpose', () => {
+            // MATLAB binds transpose tight: `A '` is an unterminated char array
+            // error, not a transpose, so whitespace before a quote always opens
+            // a string. Skipping whitespace here defeated the whole module on
+            // switch/case over char options and on message building.
+            const cases: Array<[string, string]> = [
+                ["case 'plot'", 'plot'],
+                ["otherwise 'plot'", 'plot'],
+                ["disp 'plot this'", 'plot'],
+                ["xlabel 'plot'", 'plot'],
+                ["f = @(k) 'plot'", 'plot'],
+                ["msg = [num2str(x) ' plot']", 'plot'],
+                ["c = {'Name' 'plot'}", "' 'plot"],
+                ["s = ['x' 'plot']", "' 'plot"]
+            ]
+
+            for (const [line, needle] of cases) {
+                const index = line.indexOf(needle) + (needle.startsWith("'") ? 3 : 0)
+                assert.equal(contextAt(line, index), TokenContext.String,
+                    `"${line}" should classify the quoted text as a string`)
+            }
+        })
+
+        it('should restore code classification after a whitespace-preceded string closes', () => {
+            const line = "case 'plot', doStuff(x)"
+            assert.equal(contextAt(line, line.indexOf('doStuff')), TokenContext.Code,
+                'code after the string must not be swallowed')
+        })
+
         it('should treat a quote after = as opening a char array', () => {
             const line = "name = 'plot'"
             assert.equal(contextAt(line, line.indexOf('plot')), TokenContext.String,

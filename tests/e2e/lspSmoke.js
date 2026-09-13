@@ -39,7 +39,8 @@ const DOC_TEXT = [
     'function out = localHelper(a)',                    // 12
     '%LOCALHELPER Passes a straight through.',          // 13
     'out = a;',                                         // 14
-    'end'                                               // 15
+    'end',                                              // 15
+    "kind = 'x'; switch kind, case 'plot', disp(1); end" // 16
 ].join('\n')
 
 const args = ['--stdio']
@@ -206,9 +207,14 @@ async function main () {
     const inString = await hoverAt(6, stringCol)
     check('hover inside a char array returns null', inString == null, firstLine(inString))
 
-    // Transpose on line 9 must not swallow the rest of the line.
-    const afterTranspose = await hoverAt(9, 4)
-    check('transpose line does not break classification', true, firstLine(afterTranspose))
+    // Line 9 is "t = y(1)' + 1;". If the transpose were read as opening a char
+    // array, everything after it would be classified as a string and hover would
+    // be suppressed. Probe the `+` after it, which resolves from the bundled
+    // operator table and so works with no index and no MATLAB.
+    const transposeLine = DOC_TEXT.split('\n')[9]
+    const afterTranspose = await hoverAt(9, transposeLine.indexOf('+'))
+    check('transpose does not swallow the rest of the line',
+        afterTranspose != null, firstLine(afterTranspose))
 
     // Local function on line 7: help() returns 0 chars for this, so anything we
     // get here came from the document.
@@ -226,6 +232,20 @@ async function main () {
     }
 
     if (USE_MATLAB) {
+        // A char array preceded by whitespace must still suppress hover. This is
+        // only a real assertion with MATLAB attached: without it, `plot` yields
+        // no card whatever the gate decides, so the check would pass vacuously.
+        const caseLine = DOC_TEXT.split('\n')[16]
+        const inCaseString = await hoverAt(16, caseLine.indexOf('plot'))
+        check('hover suppressed inside a whitespace-preceded char array',
+            inCaseString == null, firstLine(inCaseString))
+
+        // Control for the check above: the same builtin DOES produce a card when
+        // it is genuinely code, so suppression cannot be passing by accident.
+        const realCall = await hoverAt(16, caseLine.indexOf('disp'))
+        check('the same line still hovers real code',
+            realCall != null, firstLine(realCall))
+
         // --- the mechanism Run Section relies on: a documentSymbol request must
         // --- make the server recompute and push section ranges.
         const beforeCount = notifications.filter(n => n.method === 'matlab/sections').length

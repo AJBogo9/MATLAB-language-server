@@ -1,6 +1,7 @@
 // Copyright 2026 Andreas Bogossian
 
 import { parseArgumentsBlocks, renderArgumentsTable, ArgumentDeclaration } from './ArgumentsBlockParser'
+import { isInsideBlockComment } from './CommentStringScanner'
 
 /**
  * Builds hover content for symbols declared in the document being viewed, using
@@ -39,6 +40,12 @@ export interface OfflineSymbolInfo {
 const FUNCTION_DECLARATION = /^\s*function\s+(?:\[[^\]]*\]\s*=\s*|[A-Za-z][A-Za-z0-9_]*\s*=\s*)?([A-Za-z][A-Za-z0-9_]*)\s*(?:\(|$|%)/
 const CLASSDEF_DECLARATION = /^\s*classdef\s*(?:\([^)]*\)\s*)?([A-Za-z][A-Za-z0-9_]*)\b/
 const COMMENT_LINE = /^\s*%/
+// Deliberately looser than FUNCTION_DECLARATION: a scope ends at the next
+// function or classdef whether or not its declaration parses on one line.
+// `function [a, ...` continued onto the next line does not match the strict
+// form, so a strict scan walked straight past it and attributed the following
+// function's arguments block to this one.
+const ANY_SCOPE_START = /^\s*(?:function|classdef)\b/
 const BLOCK_COMMENT_OPEN = /^\s*%\{\s*$/
 const BLOCK_COMMENT_CLOSE = /^\s*%\}\s*$/
 
@@ -56,6 +63,13 @@ export function findDeclarationLine (
     lines: string[], name: string
 ): { line: number, kind: 'function' | 'classdef' } | null {
     for (let i = 0; i < lines.length; i++) {
+        // A declaration written inside a %{ %} block is commented out. Treating
+        // it as real hijacks the card and hides the live function's own
+        // arguments block.
+        if (isInsideBlockComment(lines, i)) {
+            continue
+        }
+
         const functionMatch = FUNCTION_DECLARATION.exec(lines[i])
         if (functionMatch != null && functionMatch[1] === name) {
             return { line: i, kind: 'function' }
@@ -162,7 +176,10 @@ function trimBlankEdges (lines: string[]): string[] {
  */
 function findScopeEnd (lines: string[], declarationLine: number): number {
     for (let i = declarationLine + 1; i < lines.length; i++) {
-        if (FUNCTION_DECLARATION.test(lines[i]) || CLASSDEF_DECLARATION.test(lines[i])) {
+        if (isInsideBlockComment(lines, i)) {
+            continue
+        }
+        if (ANY_SCOPE_START.test(lines[i])) {
             return i
         }
     }

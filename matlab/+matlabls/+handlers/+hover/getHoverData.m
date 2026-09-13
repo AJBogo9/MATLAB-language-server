@@ -38,7 +38,18 @@ function hoverData = getHoverData(topic)
         rawHelp = '';
     end
 
+    % help() does not fail on an unknown name, it fuzzy-matches and prefixes the
+    % result with "--- NAME not found. Showing help for OTHER instead. ---".
+    % Rendering that verbatim attributes another function's reference page to the
+    % hovered symbol, so treat it as no content at all and let the caller fall
+    % back to the document.
+    isNotFoundBanner = false;
     if ~isempty(rawHelp)
+        firstLine = strtrim(strtok(rawHelp, newline));
+        isNotFoundBanner = ~isempty(regexp(firstLine, '^---\s+\S+\s+not found\.', 'once'));
+    end
+
+    if ~isempty(rawHelp) && ~isNotFoundBanner
         [hoverData.helpText, hoverData.truncated] = truncateHelp(rawHelp, MAX_LINES);
     end
 
@@ -82,7 +93,7 @@ function hoverData = getHoverData(topic)
     try
         url = matlab.internal.doc.reference.getHelpPopupUrl(topic);
         url = char(url);
-        if startsWith(url, 'https://www.mathworks.com/')
+        if startsWith(url, 'https://www.mathworks.com/') && ~isNotFoundBanner
             hoverData.docUrl = url;
         end
     catch
@@ -128,21 +139,45 @@ function shadowedBy = detectShadowing(allPaths)
     % help() lists overloads itself ("Other uses of plot"), so the only
     % non-redundant thing which(-all) adds is detecting that a file on the user's
     % path shadows a toolbox function. help will never tell you that.
+    %
+    % Entries must be normalized first. which('-all') returns three shapes and
+    % only one of them is a bare path, so comparing raw strings against
+    % matlabroot inverts the test: a compiled builtin comes back as
+    % "built-in (/usr/local/MATLAB/R2026a/toolbox/.../plot)", which does not
+    % start with matlabroot, so it was read as a user file and nearly every
+    % builtin with an overload reported itself as shadowed.
     shadowedBy = '';
     if numel(allPaths) < 2
         return;
     end
 
     root = matlabroot;
-    firstIsUserFile = ~startsWith(allPaths{1}, root);
-    if ~firstIsUserFile
+    first = normalizeWhichEntry(allPaths{1});
+
+    % A built-in wrapper, a bare description, or anything under matlabroot is by
+    % definition not a user file.
+    if isempty(first) || startsWith(first, root)
         return;
     end
 
     for k = 2:numel(allPaths)
-        if startsWith(allPaths{k}, root)
-            shadowedBy = allPaths{1};
+        entry = normalizeWhichEntry(allPaths{k});
+        if ~isempty(entry) && startsWith(entry, root)
+            shadowedBy = first;
             return;
         end
+    end
+end
+
+function p = normalizeWhichEntry(entry)
+    % which('-all') returns a plain path, a "built-in (<path>)" wrapper, or a
+    % bare description such as "disp is a built-in method". Only the first two
+    % carry a path; a description must never be mistaken for a user file.
+    p = strtrim(char(entry));
+
+    if startsWith(p, 'built-in (') && endsWith(p, ')')
+        p = p(numel('built-in (') + 1:end - 1);
+    elseif ~(startsWith(p, filesep) || ~isempty(regexp(p, '^[A-Za-z]:[\\/]', 'once')))
+        p = '';
     end
 end

@@ -132,13 +132,13 @@ export function classifyLine (lineText: string): TokenContext[] {
         }
 
         if (ch === "'") {
-            let previous = ''
-            for (let j = i - 1; j >= 0; j--) {
-                if (lineText[j] !== ' ' && lineText[j] !== '\t') {
-                    previous = lineText[j]
-                    break
-                }
-            }
+            // MATLAB binds transpose tight: `A '` is an unterminated char array,
+            // not a transpose (verified on R2026a), so the character
+            // IMMEDIATELY before decides. Skipping whitespace here classified
+            // every `case 'plot'`, `disp 'text'`, `@(k) 'plot'` and
+            // `[num2str(x) ' msg']` as code, which is exactly what this module
+            // exists to prevent.
+            const previous = i > 0 ? lineText[i - 1] : ''
 
             if (isValueTerminator(previous)) {
                 // Transpose operator: stays code.

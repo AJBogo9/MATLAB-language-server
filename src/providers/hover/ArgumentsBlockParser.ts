@@ -35,8 +35,11 @@ export interface ArgumentDeclaration {
     line: number
 }
 
-const ARGUMENTS_BLOCK_START = /^\s*arguments\b(?:\s*\(\s*([A-Za-z,\s]*?)\s*\))?\s*(?:%.*)?$/
-const BLOCK_END = /^\s*end\b\s*(?:%.*)?$/
+const ARGUMENTS_BLOCK_START = /^\s*arguments\b(?:\s*\(\s*([A-Za-z,\s]*?)\s*\))?\s*(?:\s*[;,])*\s*(?:%.*)?$/
+// `end;` and `end,` are legal and close the block. Without the separator
+// the scan ran past it and parsed function-body statements as argument
+// declarations, producing a confidently false Arguments table.
+const BLOCK_END = /^\s*end\b\s*(?:\s*[;,])*\s*(?:%.*)?$/
 const IDENTIFIER = '[A-Za-z][A-Za-z0-9_]*'
 const DECLARATION_NAME = new RegExp(`^(${IDENTIFIER}(?:\\.${IDENTIFIER})?)`)
 

@@ -187,6 +187,54 @@ describe('OfflineHoverBuilder', () => {
                 'the scope scan must stop at the next function declaration')
         })
 
+        it('should not claim a later function\'s arguments when a declaration spans lines', () => {
+            // `function [a, ...` does not match the single-line declaration
+            // regex, so a strict scope scan walked straight past it and gave the
+            // first function the second one's arguments block.
+            const src = [
+                'function first(x)',
+                'y = 1;',
+                'end',
+                'function [a, ...',
+                '         b] = second(z)',
+                'arguments',
+                '    z single {mustBeReal}',
+                'end',
+                'a = z; b = z;',
+                'end'
+            ].join('\n')
+
+            const info = buildOfflineSymbolInfo(src, 'first')
+            assert.deepEqual(info?.argumentDeclarations, [],
+                'the scope must end at the continued declaration, not run through it')
+        })
+
+        it('should ignore a declaration commented out in a %{ %} block', () => {
+            const src = [
+                '%{',
+                'function y = myFn(x)',
+                'arguments',
+                '    x double {mustBeNonempty}',
+                'end',
+                'end',
+                '%}',
+                'function y = myFn(x)',
+                '%MYFN The live one.',
+                'arguments',
+                '    x string',
+                'end',
+                'y = x;',
+                'end'
+            ].join('\n')
+
+            const info = buildOfflineSymbolInfo(src, 'myFn')
+            assert.equal(info?.summary, 'The live one.',
+                'the commented-out declaration must not hijack the card')
+            assert.equal(info?.argumentDeclarations.length, 1)
+            assert.equal(info?.argumentDeclarations[0].className, 'string',
+                'and must not contribute its arguments')
+        })
+
         it('should handle a classdef', () => {
             const src = [
                 'classdef MyClass < handle',

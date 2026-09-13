@@ -222,13 +222,6 @@ class CompletionSupportProvider {
         // Gather completions from top-level object. This should find function completions.
         this.gatherCompletions(completionData, completionsMap)
 
-        // Gather the shared (global) completions. Without this, typing
-        // `noDocArgs(1,M` offers only the name-value key `Method` and loses all
-        // 344 global choices MATLAB returned alongside it.
-        if (completionData.shared != null) {
-            this.gatherCompletions(completionData.shared, completionsMap)
-        }
-
         // Gather completions from each signature. This should find function argument completions.
         let signatures = completionData.signatures
         if (signatures != null) {
@@ -246,6 +239,16 @@ class CompletionSupportProvider {
                     this.gatherCompletions(inputArgument, completionsMap)
                 })
             })
+        }
+
+        // Shared (global) completions go LAST. sortText is stamped from
+        // insertion order below, so putting the up-to-345 globals first buried
+        // the argument-specific name-value keys MATLAB computed for the argument
+        // the cursor is actually in: for `plot(x,y,M` the six Marker keys landed
+        // at positions 344-349 of 350. `overwrite: false` keeps a per-argument
+        // entry's kind and detail when a global shares its name.
+        if (completionData.shared != null) {
+            this.gatherCompletions(completionData.shared, completionsMap, false)
         }
 
         let index = 0
@@ -274,7 +277,7 @@ class CompletionSupportProvider {
      * @param completionDataObj Raw completion or argument data
      * @param completionMap A map in which to store info about possible completions
      */
-    private gatherCompletions (completionDataObj: MCompletionData | MArgumentData | MSharedData, completionMap: Map<string, { kind: CompletionItemKind, doc: string, insertText: string }>): void {
+    private gatherCompletions (completionDataObj: MCompletionData | MArgumentData | MSharedData, completionMap: Map<string, { kind: CompletionItemKind, doc: string, insertText: string }>, overwrite: boolean = true): void {
         let choices = completionDataObj.widgetData?.choices
         if (choices == null) {
             return
@@ -309,6 +312,11 @@ class CompletionSupportProvider {
                 if (dotIdx > 0 && !isPath) {
                     completion = completion.slice(dotIdx + 1)
                 }
+            }
+
+            if (!overwrite && completionMap.has(completion)) {
+                // A more specific entry already claimed this name.
+                return
             }
 
             completionMap.set(completion, {

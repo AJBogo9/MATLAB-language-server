@@ -12,7 +12,7 @@ import {
 } from '../../indexing/SymbolSearchService'
 import { getExpressionAtPosition } from '../../utils/ExpressionUtils'
 import { isInCommentOrString } from './CommentStringScanner'
-import { getOperatorHelp, findOperatorAtPosition } from './OperatorHelp'
+import { getOperatorHelp, findOperatorAtPosition, isReservedKeyword } from './OperatorHelp'
 import { buildOfflineSymbolInfo, renderArgumentsTable, OfflineSymbolInfo } from './OfflineHoverBuilder'
 import HoverCache from './HoverCache'
 
@@ -41,11 +41,6 @@ interface MHoverData {
  */
 const FUNCTION_DECLARATION_NAME = /^\s*function\s+(?:\[[^\]]*\]\s*=\s*|[A-Za-z][A-Za-z0-9_]*\s*=\s*)?([A-Za-z][A-Za-z0-9_]*)/
 
-/** A composed card, cached by resolved topic and MATLAB release. */
-interface CachedCard {
-    markdown: string
-}
-
 /**
  * Provides textDocument/hover.
  *
@@ -55,7 +50,11 @@ interface CachedCard {
  * all resolve to something confidently wrong.
  */
 class HoverSupportProvider {
-    private readonly cache = new HoverCache<CachedCard>(256)
+    // Caches the MATLAB-sourced payload only. Caching the composed card
+    // instead leaked document content across files (the key is topic plus
+    // release, but the card embeds the hovered document's own summary and
+    // arguments table) and kept showing pre-edit content after a save.
+    private readonly cache = new HoverCache<MHoverData>(256)
 
     // Deliberately does not take a DocumentIndexer. NavigationSupportProvider
     // awaits ensureDocumentIndexIsUpdated before resolving a definition, which is
@@ -121,9 +120,14 @@ class HoverSupportProvider {
         }
 
         // A keyword is a word, so the identifier scan finds it before the
-        // operator scan can.
+        // operator scan can. Only RESERVED words take the fast path: the six
+        // context-sensitive block keywords (arguments, properties, methods,
+        // events, enumeration, import) are all legal identifiers, and answering
+        // them from the table unconditionally gave the builtin's card to any
+        // variable, parameter, struct field or local function with one of those
+        // names.
         const keywordEntry = getOperatorHelp(expression.unqualifiedTarget)
-        if (keywordEntry?.isKeyword === true) {
+        if (keywordEntry != null && isReservedKeyword(expression.unqualifiedTarget)) {
             return this.toHover(this.renderKeywordCard(keywordEntry.topic, keywordEntry.text), null)
         }
 
@@ -139,6 +143,13 @@ class HoverSupportProvider {
         const topic = classified?.targetExpression ?? expression.targetExpression
         const hoverRange = classified != null ? classified.range.range : undefined
 
+        // A context-sensitive block keyword falls through to here. Answer it
+        // from the table only when the index has no opinion, which is the case
+        // for a genuine `arguments`/`properties` block header.
+        if (classified == null && keywordEntry?.isKeyword === true) {
+            return this.toHover(this.renderKeywordCard(keywordEntry.topic, keywordEntry.text), null)
+        }
+
         const offline = buildOfflineSymbolInfo(text, expression.unqualifiedTarget)
 
         // Never run help() on something the index says is a variable.
@@ -150,31 +161,32 @@ class HoverSupportProvider {
         }
 
         const cacheKey = HoverCache.keyFor(topic, this.mvm.getMatlabRelease() ?? 'unknown')
-        const cached = this.cache.get(cacheKey)
-        if (cached !== undefined) {
-            return this.toHover(cached.markdown, hoverRange)
+        let hoverData = this.cache.get(cacheKey) ?? null
+
+        if (hoverData === null) {
+            hoverData = await this.retrieveHoverData(topic, token)
+
+            if (isCancelled(token)) {
+                return null
+            }
+
+            // Only cache what a ready MATLAB answered. Caching a null would pin
+            // an offline session's emptiness for the rest of its life and never
+            // upgrade once MATLAB connects.
+            if (hoverData != null) {
+                this.cache.set(cacheKey, hoverData)
+            }
+
+            reportTelemetry(RequestType.Hover)
         }
 
-        const hoverData = await this.retrieveHoverData(topic, token)
-
-        if (isCancelled(token)) {
-            return null
-        }
-
+        // Always recompose: the document half of the card must reflect the
+        // document being hovered, right now.
         const markdown = this.renderSymbolCard(topic, hoverData, offline)
 
         if (markdown === '') {
             return null
         }
-
-        // Only cache cards that came from a ready MATLAB. An offline-only card
-        // would otherwise be pinned for the rest of the session and never
-        // upgraded once MATLAB connects.
-        if (hoverData != null) {
-            this.cache.set(cacheKey, { markdown })
-        }
-
-        reportTelemetry(RequestType.Hover)
 
         return this.toHover(markdown, hoverRange)
     }

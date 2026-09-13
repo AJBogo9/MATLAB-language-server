@@ -140,6 +140,55 @@ describe('ArgumentsBlockParser', () => {
             assert.equal(declarations[1].kind, 'output')
         })
 
+        it('should close the block on "end;" and not parse the body as arguments', () => {
+            // `end;` is legal MATLAB and Code Analyzer says nothing about it, so
+            // a developer with that habit hit this on every function. The scan
+            // ran past the block and reported body statements as declarations.
+            const src = split([
+                'function y = f(x)',
+                'arguments',
+                '    x (1,1) double',
+                'end;',
+                'y = x + 1;',
+                'total = y * 2;',
+                'result = total;',
+                'end'
+            ].join('\n'))
+
+            const declarations = parseArgumentsBlocks(src, 0, src.length)
+            assert.equal(declarations.length, 1, 'only x is an argument')
+            assert.equal(declarations[0].name, 'x')
+        })
+
+        it('should close the block on "end," and "end ;"', () => {
+            for (const terminator of ['end,', 'end ;', 'end;  % close']) {
+                const src = split([
+                    'function y = f(x)', 'arguments', '    x double', terminator, 'y = x;', 'end'
+                ].join('\n'))
+                assert.equal(parseArgumentsBlocks(src, 0, src.length).length, 1,
+                    `"${terminator}" should close the block`)
+            }
+        })
+
+        it('should still reject things that merely start with end', () => {
+            const src = split([
+                'function y = f(x)',
+                'arguments',
+                '    x double',
+                '    ending double',
+                'end',
+                'y = x;',
+                'end'
+            ].join('\n'))
+            assert.equal(parseArgumentsBlocks(src, 0, src.length).length, 2,
+                '"ending" is a declaration, not a block terminator')
+        })
+
+        it('should accept "arguments;" as a block opener', () => {
+            const src = split('function y = f(x)\narguments;\n    x double\nend\ny = x;\nend')
+            assert.equal(parseArgumentsBlocks(src, 0, src.length).length, 1)
+        })
+
         it('should return an empty array for a function with no arguments block', () => {
             const src = split('function y = f(x)\ny = x;\nend')
             assert.deepEqual(parseArgumentsBlocks(src, 0, src.length), [])

@@ -12,6 +12,11 @@ const INDEXING_DELAY = 500 // Delay (in ms) after keystroke before attempting to
  */
 export default class DocumentIndexer {
     private readonly pendingFilesToIndex = new Map<string, NodeJS.Timeout>()
+    // Parses that have started but not finished, with the document version they
+    // captured. Clearing the debounce entry when a parse begins is necessary to
+    // avoid double-parsing, but on its own it opens a window in which the
+    // document looks indexed while the index still holds pre-edit data.
+    private readonly inFlightParses = new Map<string, { version: number, promise: Promise<void> }>()
     private onIndexed?: (uri: string) => void
 
     constructor (
@@ -48,15 +53,26 @@ export default class DocumentIndexer {
         // re-parses the whole file through MATLAB: a measured 1006-1974 ms on
         // the single MATLAB thread, once per edit-then-navigate cycle.
         // LintingSupportProvider already clears its own timer this way.
-        this.clearTimerForDocumentUri(textDocument.uri)
+        const uri = textDocument.uri
+        this.clearTimerForDocumentUri(uri)
 
         // Await before announcing. The previous `void` meant onIndexed fired
         // while the parse was still in flight, so semantic highlighting rendered
         // from a cache one edit behind. Both external callers already discard
         // the result with `void`, so widening the return type is source
         // compatible.
-        await this.indexer.indexDocument(textDocument)
-        this.onIndexed?.(textDocument.uri)
+        const promise = this.indexer.indexDocument(textDocument)
+        this.inFlightParses.set(uri, { version: textDocument.version, promise })
+
+        try {
+            await promise
+        } finally {
+            if (this.inFlightParses.get(uri)?.promise === promise) {
+                this.inFlightParses.delete(uri)
+            }
+        }
+
+        this.onIndexed?.(uri)
     }
 
     /**
@@ -82,6 +98,22 @@ export default class DocumentIndexer {
     async ensureDocumentIndexIsUpdated (textDocument: TextDocument): Promise<void> {
         const uri = textDocument.uri
         let didIndex = false
+
+        // Wait for a parse that is already running. Without this there is a
+        // window, from the moment the debounce fires until MATLAB answers, in
+        // which the document is neither pending nor cached-fresh, so this method
+        // returned immediately and the caller acted on the pre-edit index. That
+        // is how Run Section could execute the wrong lines after an edit.
+        const inFlight = this.inFlightParses.get(uri)
+        if (inFlight !== undefined) {
+            await inFlight.promise
+            if (inFlight.version < textDocument.version) {
+                // The document changed while that parse was running, and the
+                // parse captured its text before the change.
+                await this.indexer.indexDocument(textDocument)
+                didIndex = true
+            }
+        }
 
         if (this.pendingFilesToIndex.has(uri)) {
             this.clearTimerForDocumentUri(uri)

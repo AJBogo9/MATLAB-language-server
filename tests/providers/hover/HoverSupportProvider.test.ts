@@ -144,6 +144,41 @@ describe('HoverSupportProvider', () => {
             assert.equal(matlab.called, false)
         })
 
+        it('should not give a variable named "properties" the block keyword card', async () => {
+            // arguments, properties, methods, events, enumeration and import are
+            // context-sensitive, not reserved, so they are all legal identifiers.
+            setup('properties = struct();\ny = properties;')
+            classifyAs(SymbolClassification.Variable, 'properties')
+            const matlab = stubMatlab({ helpText: 'should never be reached' })
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(1, 6), documentManager))
+
+            assert.ok(text.includes('variable'), 'the index says it is a variable, so show the variable card')
+            assert.ok(!text.includes('Class properties'), 'not the block keyword documentation')
+            assert.equal(matlab.called, false)
+        })
+
+        it('should still answer a genuine block keyword from the table', async () => {
+            setup('function y = f(x)\narguments\n    x double\nend\ny = x;\nend')
+            sinon.stub(provider as any, 'classify').returns(null)
+            const matlab = stubMatlab({ helpText: 'should never be reached' })
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(1, 2), documentManager))
+
+            assert.ok(text.includes('arguments'), 'a real block header still gets the bundled card')
+            assert.equal(matlab.called, false)
+        })
+
+        it('should take the fast path for a genuinely reserved keyword', async () => {
+            setup('for k = 1:10\nend')
+            const classifySpy = sinon.stub(provider as any, 'classify').returns(null)
+
+            await provider.handleHoverRequest(paramsAt(0, 1), documentManager)
+
+            assert.equal(classifySpy.called, false,
+                'a reserved word can never be a user symbol, so the index need not be consulted')
+        })
+
         it('should hover operators even when MATLAB is not ready', async () => {
             setup('y = a ./ b;')
             mockMvm.isReady.returns(false)
@@ -368,6 +403,54 @@ describe('HoverSupportProvider', () => {
 
             assert.equal(matlab.callCount, 2,
                 'an offline card must not be pinned for the session and never upgraded once MATLAB connects')
+        })
+
+        it('should not serve one document\'s content as another document\'s card', async () => {
+            // The cache key is topic + release, but the card embeds the hovered
+            // document's own summary and arguments table. Caching the composed
+            // card therefore leaked file A's content onto file B.
+            setup([
+                'function y = shared(x)',
+                '%SHARED Summary from file A.',
+                'y = x;',
+                'end'
+            ].join('\n'))
+            classifyAs(SymbolClassification.FunctionOrUnbound, 'shared')
+            stubMatlab({ helpText: ' shared - MATLAB help text' })
+
+            const first = valueOf(await provider.handleHoverRequest(paramsAt(0, 14), documentManager))
+            assert.ok(first.includes('Summary from file A.'))
+
+            // Same symbol name, different document.
+            ;(documentManager.get as sinon.SinonStub).returns(TextDocument.create(
+                'file:///other.m', 'matlab', 1,
+                ['function y = shared(x)', '%SHARED Summary from file B.', 'y = x;', 'end'].join('\n')
+            ))
+
+            const second = valueOf(await provider.handleHoverRequest(paramsAt(0, 14), documentManager))
+
+            assert.ok(second.includes('Summary from file B.'),
+                'the card must describe the document actually being hovered')
+            assert.ok(!second.includes('Summary from file A.'),
+                'file A content must not leak through the cache')
+        })
+
+        it('should reflect an edit to the hovered document even on a cache hit', async () => {
+            setup(['function y = f(x)', '%F Before the edit.', 'y = x;', 'end'].join('\n'))
+            classifyAs(SymbolClassification.FunctionOrUnbound, 'f')
+            const matlab = stubMatlab({ helpText: ' f - MATLAB help text' })
+
+            await provider.handleHoverRequest(paramsAt(0, 13), documentManager)
+
+            ;(documentManager.get as sinon.SinonStub).returns(TextDocument.create(
+                'file:///test.m', 'matlab', 2,
+                ['function y = f(x)', '%F After the edit.', 'y = x;', 'end'].join('\n')
+            ))
+
+            const second = valueOf(await provider.handleHoverRequest(paramsAt(0, 13), documentManager))
+
+            assert.ok(second.includes('After the edit.'), 'the document half must be recomposed')
+            assert.equal(matlab.callCount, 1, 'while the MATLAB half stays cached')
         })
 
         it('should re-query MATLAB after the cache is cleared', async () => {

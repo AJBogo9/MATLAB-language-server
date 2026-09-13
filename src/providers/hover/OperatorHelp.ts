@@ -143,6 +143,25 @@ export function findOperatorAtPosition (
     return null
 }
 
+/**
+ * The six block keywords the generator adds beyond iskeyword(). They are
+ * context-sensitive rather than reserved, so `properties`, `methods`,
+ * `events`, `arguments`, `enumeration` and `import` are all legal
+ * variable and function names and must not short-circuit symbol classification.
+ */
+const CONTEXT_SENSITIVE = new Set(['arguments', 'properties', 'methods', 'events', 'enumeration', 'import'])
+
+/**
+ * True only for the 20 genuinely reserved words, which can never be a user
+ * symbol and so may be answered without consulting the index.
+ *
+ * @param topic The identifier under the cursor
+ * @returns Whether the topic is a reserved MATLAB keyword
+ */
+export function isReservedKeyword (topic: string): boolean {
+    return BY_TOPIC.get(topic)?.isKeyword === true && !CONTEXT_SENSITIVE.has(topic)
+}
+
 /** Every keyword and operator with bundled help. Exposed for tests. */
 export function getAllTopics (): string[] {
     return ENTRIES.map(e => e.topic)
