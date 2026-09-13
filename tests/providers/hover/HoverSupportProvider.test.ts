@@ -300,8 +300,180 @@ describe('HoverSupportProvider', () => {
 
             assert.ok(text.includes('**fft**'), 'the name should be bold')
             assert.ok(text.includes('Y = fft(X,n)'), 'every overload signature should appear')
-            assert.ok(text.includes('Input Arguments'), 'the help body should appear')
+            assert.ok(text.includes('```matlab\n    Input Arguments\n      X - Input array\n```'),
+                'help text from MATLAB is laid out already, so it stays preformatted')
             assert.ok(text.includes('[Documentation](https://www.mathworks.com/'), 'the doc link should appear')
+        })
+
+        it('should render a hard-wrapped comment on a local function as one paragraph', async () => {
+            setup([
+                'exportgraphics(gcf, "fig.png");',
+                'strip_timestamps("fig.png");',
+                '',
+                'function strip_timestamps(file)',
+                '    % drop the export time that exportgraphics writes into the PNG (its tIME',
+                '    % chunk and "Creation Time" text chunk), so rerunning the script leaves an',
+                '    % unchanged figure byte-identical and git does not report it as modified',
+                'end'
+            ].join('\n'))
+            classifyAs(SymbolClassification.FunctionOrUnbound, 'strip_timestamps')
+            stubMatlab(null)
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(1, 3), documentManager))
+            const lines = text.split('\n')
+
+            assert.strictEqual(lines[0], '**strip_timestamps**', 'the title must not take half the sentence')
+            assert.ok(lines.includes(
+                'drop the export time that exportgraphics writes into the PNG (its tIME chunk and "Creation Time" ' +
+                'text chunk), so rerunning the script leaves an unchanged figure byte-identical and git does not ' +
+                'report it as modified'), text)
+            assert.deepStrictEqual(lines.filter(l => l.startsWith('```')), ['```matlab', '```'],
+                'only the signature is fenced')
+        })
+
+        it('should not repeat the summary of a function whose help comes from its own file', async () => {
+            setup([
+                'function y = userH1(x)',
+                '%USERH1 Adds one to its input.',
+                '%   Y = USERH1(X) returns X plus one, and this sentence',
+                '%   wraps onto a second line.',
+                '%',
+                '%   Example:',
+                '%       y = userH1(3);',
+                'y = x + 1;',
+                'end'
+            ].join('\n'))
+            classifyAs(SymbolClassification.FunctionOrUnbound, 'userH1')
+            // Recorded from R2026a with the file on the path
+            stubMatlab({
+                topic: 'userH1',
+                helpText: ' USERH1 Adds one to its input.\n    Y = USERH1(X) returns X plus one, and this sentence\n' +
+                    '    wraps onto a second line.\n \n    Example:\n        y = userH1(3);',
+                signatures: ['Y = userH1(X)'],
+                isResolved: 1,
+                isBuiltin: 0,
+                whichPath: '/work/userH1.m',
+                docUrl: '',
+                shadowedBy: '',
+                truncated: 0
+            })
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(0, 15), documentManager))
+
+            assert.strictEqual(text.split('Adds one to its input.').length - 1, 1, text)
+            assert.ok(text.includes('Y = USERH1(X) returns X plus one, and this sentence wraps onto a second line.'), text)
+            assert.ok(text.includes('```text\ny = userH1(3);\n```'), text)
+        })
+
+        it('should show the comment being edited rather than the saved one help() reads', async () => {
+            setup(['function y = f(x)', '%F Summary.', '%', '%   New body text.', 'y = x;', 'end'].join('\n'))
+            classifyAs(SymbolClassification.FunctionOrUnbound, 'f')
+            stubMatlab({ helpText: ' F Summary.\n \n    Old body text.' })
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(0, 13), documentManager))
+
+            assert.ok(text.includes('New body text.'), text)
+            assert.ok(!text.includes('Old body text.'), text)
+        })
+
+        it('should describe a local function that shares a MathWorks name only from this file', async () => {
+            setup([
+                'y = normalize(x);',
+                '',
+                'function y = normalize(x)',
+                '    % scale each column of x to unit length, leaving',
+                '    % zero columns unchanged',
+                '    y = x;',
+                'end'
+            ].join('\n'))
+            classifyAs(SymbolClassification.FunctionOrUnbound, 'normalize')
+            // help() answers for the MathWorks function of that name
+            stubMatlab({
+                helpText: ' normalize - Normalize data\n    Syntax\n      N = normalize(A)',
+                signatures: ['N = normalize(A)'],
+                whichPath: '/usr/local/MATLAB/R2026a/toolbox/matlab/datafun/normalize.m',
+                docUrl: 'https://www.mathworks.com/help/matlab/ref/normalize.html'
+            })
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(0, 6), documentManager))
+
+            assert.strictEqual(text.split('\n')[0], '**normalize**', text)
+            assert.ok(text.includes('scale each column of x to unit length, leaving zero columns unchanged'), text)
+            assert.ok(text.includes('y = normalize(x)'), 'the signature declared here')
+            assert.ok(!text.includes('N = normalize(A)'), 'not the MathWorks signature')
+            assert.ok(!text.includes('[Documentation]'), 'nor its documentation link')
+        })
+
+        it('should not describe a package function with a local function that shares its last name', async () => {
+            setup([
+                'cfg = mypkg.parse(file);',
+                '',
+                'function out = parse(cfg)',
+                '    % pull the numeric fields out of cfg',
+                'end'
+            ].join('\n'))
+            classifyAs(SymbolClassification.FunctionOrUnbound, 'mypkg.parse')
+            stubMatlab({ helpText: ' C = mypkg.parse(FILE) reads FILE and returns a struct.', signatures: ['C = mypkg.parse(FILE)'] })
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(0, 14), documentManager))
+
+            assert.ok(text.includes('reads FILE and returns a struct.'), text)
+            assert.ok(!text.includes('pull the numeric fields'), text)
+        })
+
+        it('should describe a method of the class declared in this file from its comment', async () => {
+            setup([
+                'classdef Counter < handle',
+                '    methods',
+                '        function increment(obj)',
+                '            % add one to the count, wrapping',
+                '            % back to zero past the limit',
+                '            obj.Count = obj.Count + 1;',
+                '        end',
+                '        function reset(obj)',
+                '            obj.increment();',
+                '        end',
+                '    end',
+                'end'
+            ].join('\n'))
+            classifyAs(SymbolClassification.FunctionOrUnbound, 'Counter.increment')
+            stubMatlab({ helpText: ' INCREMENT saved help text.' })
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(8, 18), documentManager))
+
+            assert.ok(text.includes('add one to the count, wrapping back to zero past the limit'), text)
+            assert.ok(!text.includes('saved help text'), text)
+        })
+
+        it('should keep the shadowing warning when help() describes the hovered file itself', async () => {
+            // setup opens the document as file:///test.m
+            setup(['function plot(x)', '%PLOT My own plot.', 'disp(x)', 'end'].join('\n'))
+            classifyAs(SymbolClassification.FunctionOrUnbound, 'plot')
+            stubMatlab({ helpText: ' PLOT My own plot.', whichPath: '/test.m', shadowedBy: '/test.m' })
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(0, 10), documentManager))
+
+            assert.ok(text.includes('Shadowed by `/test.m`'), text)
+        })
+
+        it('should use help() for a symbol declared here without a doc comment', async () => {
+            setup(['function y = f(x)', 'y = x;', 'end'].join('\n'))
+            classifyAs(SymbolClassification.FunctionOrUnbound, 'f')
+            stubMatlab({ helpText: ' F Saved help text.' })
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(0, 13), documentManager))
+
+            assert.ok(text.includes('```matlab\n F Saved help text.\n```'), text)
+        })
+
+        it('should escape markdown in the summary', async () => {
+            setup(['function y = f(x)', '%F Scales by *k* and adds _b_.', 'y = x;', 'end'].join('\n'))
+            classifyAs(SymbolClassification.FunctionOrUnbound, 'f')
+            stubMatlab(null)
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(0, 13), documentManager))
+
+            assert.strictEqual(text.split('\n')[0], '**f**  ·  Scales by \\*k\\* and adds \\_b\\_.')
         })
 
         it('should strip the Syntax section already rendered as signatures', async () => {

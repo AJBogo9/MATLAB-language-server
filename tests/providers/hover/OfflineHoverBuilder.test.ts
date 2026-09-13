@@ -130,6 +130,112 @@ describe('OfflineHoverBuilder', () => {
         it('should separate the summary from the body', () => {
             const info = buildOfflineSymbolInfo(AFTER_STYLE, 'afterStyle')
             assert.equal(info?.body, '  Detailed explanation on a second line.')
+            assert.equal(info?.bodyMarkdown, 'Detailed explanation on a second line.')
+        })
+
+        it('should keep a wrapped first sentence out of the summary', () => {
+            const src = [
+                'function strip_timestamps(file)',
+                '    % drop the export time that exportgraphics writes into the PNG (its tIME',
+                '    % chunk and "Creation Time" text chunk), so rerunning the script leaves an',
+                '    % unchanged figure byte-identical and git does not report it as modified',
+                'end'
+            ].join('\n')
+
+            const info = buildOfflineSymbolInfo(src, 'strip_timestamps')
+
+            assert.equal(info?.summary, undefined, 'half a sentence is not a summary')
+            assert.equal(info?.hasDocComment, true)
+            assert.equal(info?.bodyMarkdown,
+                'drop the export time that exportgraphics writes into the PNG (its tIME chunk and "Creation Time" ' +
+                'text chunk), so rerunning the script leaves an unchanged figure byte-identical and git does not ' +
+                'report it as modified')
+        })
+
+        it('should take a first line followed by a blank comment line as the summary', () => {
+            const src = ['function f(x)', '%F Does things.', '%', '%   More detail', '%   continues here.', 'end'].join('\n')
+
+            const info = buildOfflineSymbolInfo(src, 'f')
+
+            assert.equal(info?.summary, 'Does things.')
+            assert.equal(info?.bodyMarkdown, 'More detail continues here.')
+        })
+
+        it('should keep a block comment preformatted and out of the summary', () => {
+            const src = ['function f(x)', '%{', 'Usage:', '   f(1)', '%}', 'end'].join('\n')
+
+            const info = buildOfflineSymbolInfo(src, 'f')
+
+            assert.equal(info?.summary, undefined)
+            assert.equal(info?.bodyMarkdown, '```text\nUsage:\n   f(1)\n```')
+        })
+
+        it('should take a complete first sentence as the summary even when the next line is at the same depth', () => {
+            const src = [
+                'function path = resolveStackFrame(names)',
+                '    % RESOLVESTACKFRAME Finds the file that defines a frame of a MATLAB stack trace.',
+                '    % Takes candidate names from the most to the least specific.',
+                'end'
+            ].join('\n')
+
+            const info = buildOfflineSymbolInfo(src, 'resolveStackFrame')
+
+            assert.equal(info?.summary, 'Finds the file that defines a frame of a MATLAB stack trace.')
+            assert.equal(info?.bodyMarkdown, 'Takes candidate names from the most to the least specific.')
+        })
+
+        it('should drop the capitalised name from a wrapped first line that is not a summary', () => {
+            const src = [
+                'function result = parseInfoFromDocument(code)',
+                '    % PARSEINFOFROMDOCUMENT Parses the given MATLAB code and extracts information about',
+                '    % variables, functions, etc.',
+                'end'
+            ].join('\n')
+
+            const info = buildOfflineSymbolInfo(src, 'parseInfoFromDocument')
+
+            assert.equal(info?.summary, undefined)
+            assert.equal(info?.bodyMarkdown, 'Parses the given MATLAB code and extracts information about variables, functions, etc.')
+        })
+
+        it('should read %NAME followed by % text as a summary and a body', () => {
+            const info = buildOfflineSymbolInfo(['function out = foo(in)', '%FOO Does stuff', '% More details here', 'end'].join('\n'), 'foo')
+
+            assert.equal(info?.summary, 'Does stuff')
+            assert.equal(info?.bodyMarkdown, 'More details here')
+        })
+
+        it('should count a tab after % as indentation', () => {
+            const info = buildOfflineSymbolInfo(['function y = f(x)', '%F Summary line', '%\tY = F(X) does something', 'end'].join('\n'), 'f')
+
+            assert.equal(info?.summary, 'Summary line')
+            assert.equal(info?.bodyMarkdown, 'Y = F(X) does something')
+        })
+
+        it('should keep an argument list preformatted', () => {
+            const src = [
+                'function runTests(testFiles, testNames, responseChannel)',
+                '%RUNTESTS Run MATLAB unit tests with streaming results.',
+                '%   testFiles       - cell array of absolute file paths',
+                '%   testNames       - cell array of specific test names (empty = run all)',
+                '%   responseChannel - Faye channel for publishing per-test events',
+                'end'
+            ].join('\n')
+
+            const info = buildOfflineSymbolInfo(src, 'runTests')
+
+            assert.equal(info?.summary, 'Run MATLAB unit tests with streaming results.')
+            assert.equal(info?.bodyMarkdown,
+                '```text\ntestFiles       - cell array of absolute file paths\n' +
+                'testNames       - cell array of specific test names (empty = run all)\n' +
+                'responseChannel - Faye channel for publishing per-test events\n```')
+        })
+
+        it('should report a declaration without a doc comment', () => {
+            const info = buildOfflineSymbolInfo('function f(x)\ny = x;\nend', 'f')
+
+            assert.equal(info?.hasDocComment, false)
+            assert.equal(info?.bodyMarkdown, undefined)
         })
 
         it('should parse the arguments block, which no MATLAB API exposes', () => {

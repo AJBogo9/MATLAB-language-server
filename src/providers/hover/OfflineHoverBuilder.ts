@@ -2,6 +2,7 @@
 
 import { parseArgumentsBlocks, renderArgumentsTable, ArgumentDeclaration } from './ArgumentsBlockParser'
 import { computeBlockCommentLines } from './CommentStringScanner'
+import { DocCommentLine, firstLineIsSummary, indentColumns, renderDocComment } from './DocCommentMarkdown'
 
 /**
  * Builds hover content for symbols declared in the document being viewed, using
@@ -29,10 +30,17 @@ export interface OfflineSymbolInfo {
     declarationLine: number
     /** The declaration line text, whitespace-normalized. */
     signature: string
-    /** The H1 line: MATLAB's one-line summary, with leading % and name stripped. */
+    /** Whether the declaration has a doc comment. */
+    hasDocComment: boolean
+    /**
+     * The H1 line: MATLAB's one-line summary, with leading % and name stripped. Only a first
+     * comment line that is a paragraph of its own counts.
+     */
     summary?: string
-    /** The remaining doc comment body, % markers stripped. */
+    /** The rest of the doc comment, % markers stripped. */
     body?: string
+    /** The rest of the doc comment as markdown, with its paragraphs joined. */
+    bodyMarkdown?: string
     /** Parsed `arguments` block declarations, if any. */
     argumentDeclarations: ArgumentDeclaration[]
 }
@@ -130,6 +138,10 @@ function joinContinuations (lines: string[], start: number): { text: string, end
  * @returns The comment lines with their leading % stripped, in source order
  */
 export function extractDocComment (lines: string[], declarationLine: number): string[] {
+    return extractDocCommentLines(lines, declarationLine).map(line => line.text)
+}
+
+function extractDocCommentLines (lines: string[], declarationLine: number): DocCommentLine[] {
     // A declaration continued with `...` spans several physical lines, and the
     // help block follows the last of them. Starting at declarationLine + 1 found
     // the continuation itself, which is not a comment, so such a function got no
@@ -143,8 +155,8 @@ export function extractDocComment (lines: string[], declarationLine: number): st
     return collectCommentBlockBackward(lines, declarationLine - 1)
 }
 
-function collectCommentBlockForward (lines: string[], start: number): string[] {
-    const collected: string[] = []
+function collectCommentBlockForward (lines: string[], start: number): DocCommentLine[] {
+    const collected: DocCommentLine[] = []
     let i = start
 
     // A blank line between the declaration and its comment ends the help block
@@ -155,7 +167,7 @@ function collectCommentBlockForward (lines: string[], start: number): string[] {
         if (BLOCK_COMMENT_OPEN.test(line)) {
             i++
             while (i < lines.length && !BLOCK_COMMENT_CLOSE.test(lines[i])) {
-                collected.push(lines[i])
+                collected.push({ text: lines[i], preformatted: true })
                 i++
             }
             i++
@@ -166,37 +178,39 @@ function collectCommentBlockForward (lines: string[], start: number): string[] {
             break
         }
 
-        collected.push(stripCommentMarker(line))
+        collected.push(commentLine(line))
         i++
     }
 
     return trimBlankEdges(collected)
 }
 
-function collectCommentBlockBackward (lines: string[], start: number): string[] {
-    const collected: string[] = []
+function collectCommentBlockBackward (lines: string[], start: number): DocCommentLine[] {
+    const collected: DocCommentLine[] = []
     let i = start
 
     while (i >= 0 && COMMENT_LINE.test(lines[i])) {
-        collected.unshift(stripCommentMarker(lines[i]))
+        collected.unshift(commentLine(lines[i]))
         i--
     }
 
     return trimBlankEdges(collected)
 }
 
-function stripCommentMarker (line: string): string {
-    // Strip one leading %, then one following space, so indentation inside the
-    // comment block is preserved.
-    return line.replace(/^(\s*)%\s?/, '')
+function commentLine (line: string): DocCommentLine {
+    // Strip one leading %, then one following space, so indentation inside the comment
+    // block is preserved. The depth counts from the % itself, so %NAME followed by % text
+    // reads as a summary and a body, and a tab after % keeps its depth.
+    const afterMarker = line.replace(/^\s*%/, '')
+    return { text: afterMarker.replace(/^ /, ''), preformatted: false, indent: indentColumns(afterMarker) }
 }
 
-function trimBlankEdges (lines: string[]): string[] {
+function trimBlankEdges (lines: DocCommentLine[]): DocCommentLine[] {
     const result = [...lines]
-    while (result.length > 0 && result[0].trim() === '') {
+    while (result.length > 0 && result[0].text.trim() === '') {
         result.shift()
     }
-    while (result.length > 0 && result[result.length - 1].trim() === '') {
+    while (result.length > 0 && result[result.length - 1].text.trim() === '') {
         result.pop()
     }
     return result
@@ -269,7 +283,7 @@ export function buildOfflineSymbolInfo (documentText: string, name: string): Off
         return null
     }
 
-    const comment = extractDocComment(lines, declaration.line)
+    const comment = extractDocCommentLines(lines, declaration.line)
     const signature = extractSignature(lines, declaration.line)
 
     // MATLAB's H1 convention is that the first comment line is the one-line
@@ -277,19 +291,27 @@ export function buildOfflineSymbolInfo (documentText: string, name: string): Off
     // leading name so the card does not read "myAdder - MYADDER Add two numbers".
     let summary: string | undefined
     let body: string | undefined
+    let bodyMarkdown: string | undefined
 
-    if (comment.length > 0) {
-        summary = comment[0].trim()
+    const hasSummaryLine = firstLineIsSummary(comment)
+    if (hasSummaryLine) {
+        summary = comment[0].text.trim()
         const leadingName = new RegExp(`^${escapeRegExp(name)}\\b[\\s:-]*`, 'i')
         summary = summary.replace(leadingName, '').trim()
         if (summary === '') {
             summary = undefined
         }
+    }
 
-        const rest = trimBlankEdges(comment.slice(1))
-        if (rest.length > 0) {
-            body = rest.join('\n')
-        }
+    const rest = trimBlankEdges(hasSummaryLine ? comment.slice(1) : comment)
+    if (!hasSummaryLine && rest.length > 0 && !rest[0].preformatted) {
+        // A first line that is not a summary can still open with the name in capitals
+        const capitalisedName = new RegExp(`^(\\s*)${escapeRegExp(name.toUpperCase())}\\b[\\s:-]*`)
+        rest[0] = { ...rest[0], text: rest[0].text.replace(capitalisedName, '$1') }
+    }
+    if (rest.length > 0) {
+        body = rest.map(line => line.text).join('\n')
+        bodyMarkdown = renderDocComment(rest)
     }
 
     const argumentDeclarations = declaration.kind === 'function'
@@ -301,8 +323,10 @@ export function buildOfflineSymbolInfo (documentText: string, name: string): Off
         kind: declaration.kind,
         declarationLine: declaration.line,
         signature,
+        hasDocComment: comment.length > 0,
         summary,
         body,
+        bodyMarkdown,
         argumentDeclarations
     }
 }

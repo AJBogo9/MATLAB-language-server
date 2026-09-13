@@ -2,6 +2,7 @@
 
 import { CancellationToken, Hover, HoverParams, MarkupKind, Range, TextDocuments } from 'vscode-languageserver'
 import { TextDocument } from 'vscode-languageserver-textdocument'
+import { URI } from 'vscode-uri'
 import MatlabLifecycleManager from '../../lifecycle/MatlabLifecycleManager'
 import MVM from '../../mvm/impl/MVM'
 import Logger from '../../logging/Logger'
@@ -12,6 +13,7 @@ import {
 } from '../../indexing/SymbolSearchService'
 import { getExpressionAtPosition } from '../../utils/ExpressionUtils'
 import { isInCommentOrString } from './CommentStringScanner'
+import { escapeMarkdown } from './DocCommentMarkdown'
 import { getOperatorHelp, findOperatorAtPosition, isReservedKeyword } from './OperatorHelp'
 import { buildOfflineSymbolInfo, renderArgumentsTable, OfflineSymbolInfo } from './OfflineHoverBuilder'
 import HoverCache from './HoverCache'
@@ -184,8 +186,13 @@ class HoverSupportProvider {
         }
 
         // Always recompose: the document half of the card must reflect the
-        // document being hovered, right now.
-        const markdown = this.renderSymbolCard(topic, hoverData, offline)
+        // document being hovered, right now. A qualified name such as mypkg.parse only
+        // shares its last part with a function declared here, unless the qualifier is the
+        // class this document declares.
+        const declared = offline != null && declaresTopic(text, topic, offline.name) ? offline : null
+        const helpIsForThisFile = hoverData?.whichPath != null && hoverData.whichPath !== '' &&
+            URI.parse(uri).fsPath === hoverData.whichPath
+        const markdown = this.renderSymbolCard(topic, hoverData, declared, helpIsForThisFile)
 
         if (markdown === '') {
             return null
@@ -343,26 +350,39 @@ class HoverSupportProvider {
      * treated as alternatives: help() cannot see an `arguments` block or an
      * unsaved buffer, and the document cannot see a builtin.
      */
-    private renderSymbolCard (topic: string, data: MHoverData | null, offline: OfflineSymbolInfo | null): string {
+    private renderSymbolCard (
+        topic: string, data: MHoverData | null, offline: OfflineSymbolInfo | null, helpIsForThisFile: boolean
+    ): string {
         const parts: string[] = []
 
-        // Prefer the document's own H1, then MATLAB's. help() opens with
-        // " fft - Fast Fourier transform", which belongs on the title line
-        // rather than buried at the top of the body.
+        // A symbol declared in this document is described by its comment here. help() reads
+        // the saved file, so its text can be stale, and for a file on the path it is the same
+        // comment again, which repeated the summary line under the title.
+        const documentComment = offline?.hasDocComment === true ? offline : null
+
+        // help() opens with " fft - Fast Fourier transform", which belongs on the
+        // title line rather than buried at the top of the body.
         const helpSummary = extractHelpSummary(topic, data?.helpText)
-        const summary = offline?.summary ?? helpSummary
-        parts.push(summary != null && summary !== '' ? '**' + topic + '**  ·  ' + summary : '**' + topic + '**')
+        const summary = documentComment != null ? documentComment.summary : helpSummary
+        parts.push(summary != null && summary !== '' ? '**' + topic + '**  ·  ' + escapeMarkdown(summary) : '**' + topic + '**')
 
         const signatures = this.normalizeSignatures(data, offline)
         if (signatures.length > 0) {
             parts.push('', '```matlab', signatures.join('\n'), '```')
         }
 
-        const body = this.composeBody(data, offline, signatures.length > 0)
-        // Drop the summary line from the body when it was promoted above.
-        const trimmedBody = helpSummary != null ? stripLeadingSummaryLine(body, topic) : body
-        if (trimmedBody !== '') {
-            parts.push('', '```matlab', trimmedBody, '```')
+        if (documentComment != null) {
+            // Prose, so the hover reflows lines the author wrapped by hand
+            if (documentComment.bodyMarkdown != null) {
+                parts.push('', documentComment.bodyMarkdown)
+            }
+        } else {
+            const body = this.composeHelpBody(data, signatures.length > 0)
+            // Drop the summary line from the body when it was promoted above.
+            const trimmedBody = helpSummary != null ? stripLeadingSummaryLine(body, topic) : body
+            if (trimmedBody !== '') {
+                parts.push('', '```matlab', trimmedBody, '```')
+            }
         }
 
         const argumentsTable = offline != null ? renderArgumentsTable(offline.argumentDeclarations) : ''
@@ -370,7 +390,10 @@ class HoverSupportProvider {
             parts.push('', '**Arguments**', '', '```matlab', argumentsTable, '```')
         }
 
-        if (data?.shadowedBy != null && data.shadowedBy !== '') {
+        // What help() says about another file does not describe a symbol declared here
+        const describesThisSymbol = offline == null || helpIsForThisFile
+
+        if (describesThisSymbol && data?.shadowedBy != null && data.shadowedBy !== '') {
             parts.push('', '⚠ Shadowed by `' + data.shadowedBy + '`')
         }
 
@@ -378,7 +401,7 @@ class HoverSupportProvider {
         // returns per-session https://127.0.0.1:<rotating port>/ URLs for user
         // files and for licensed-but-not-installed toolboxes, and the .m handler
         // filters those out before they reach here.
-        if (data?.docUrl != null && data.docUrl !== '') {
+        if (describesThisSymbol && data?.docUrl != null && data.docUrl !== '') {
             parts.push('', '[Documentation](' + data.docUrl + ')')
         }
 
@@ -395,6 +418,11 @@ class HoverSupportProvider {
     }
 
     private normalizeSignatures (data: MHoverData | null, offline: OfflineSymbolInfo | null): string[] {
+        // A declaration in this document is its own signature; help() may describe another file
+        if (offline?.signature != null && offline.signature !== '') {
+            return [offline.signature]
+        }
+
         let signatures: string[] = []
 
         if (data?.signatures != null) {
@@ -405,33 +433,20 @@ class HoverSupportProvider {
             signatures = Array.from(new Set(signatures))
         }
 
-        if (signatures.length === 0 && offline?.signature != null && offline.signature !== '') {
-            signatures = [offline.signature]
-        }
-
         return signatures
     }
 
     /**
-     * Builds the prose body.
+     * Builds the body from MATLAB's help text.
      *
      * The Syntax block is stripped when signatures were rendered above it,
      * because help() repeats them verbatim there.
      */
-    private composeBody (data: MHoverData | null, offline: OfflineSymbolInfo | null, signaturesRendered: boolean): string {
+    private composeHelpBody (data: MHoverData | null, signaturesRendered: boolean): string {
         const helpText = data?.helpText
         if (helpText != null && helpText.trim() !== '') {
             return signaturesRendered ? stripSyntaxSection(helpText) : helpText
         }
-
-        // No MATLAB content: fall back to what the document says. This is the
-        // path that serves unsaved buffers and local functions, which help()
-        // returns nothing for.
-        const offlineBody = offline?.body
-        if (offlineBody != null && offlineBody.trim() !== '') {
-            return offlineBody
-        }
-
         return ''
     }
 
@@ -473,6 +488,23 @@ function isBlockKeywordUsage (lineText: string | undefined, name: string): boole
     // Anything that continues with an operator, a dot, an assignment or an
     // index is the token being used as a value.
     return rest === '' || rest.startsWith('(') || rest.startsWith('%')
+}
+
+/**
+ * Whether a hover topic is the symbol declared under that name in this document: the same
+ * name, or Class.name for the class the document declares.
+ *
+ * @param documentText The document text
+ * @param topic The resolved help topic
+ * @param name The name declared in the document
+ * @returns True when the declaration describes the topic
+ */
+function declaresTopic (documentText: string, topic: string, name: string): boolean {
+    if (topic === name) {
+        return true
+    }
+    const parts = topic.split('.')
+    return parts.length === 2 && parts[1] === name && buildOfflineSymbolInfo(documentText, parts[0])?.kind === 'classdef'
 }
 
 /**
