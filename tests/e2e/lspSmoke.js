@@ -616,6 +616,50 @@ async function main () {
             await fevalOverWire('rmpath', 0, [argDocsDir])
             fs.rmSync(argDocsDir, { recursive: true, force: true })
         }
+
+        // --- a test run takes each name from the file sent at its index, so a name
+        // --- that two files share runs only in the file it was chosen from
+        const runDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'testRunSmoke-'))
+        try {
+            const writeTestClass = (folder, methods) => {
+                fs.mkdirSync(path.join(runDir, folder))
+                const file = path.join(runDir, folder, 'TestRunSmoke.m')
+                fs.writeFileSync(file, ['classdef TestRunSmoke < matlab.unittest.TestCase', '    methods (Test)',
+                    ...methods.map(m => `        function ${m}(testCase)\n            testCase.verifyTrue(true)\n        end`),
+                    '    end', 'end', ''].join('\n'))
+                return file
+            }
+            const inX = writeTestClass('x', ['m1', 'm2', 'm3'])
+            const inY = writeTestClass('y', ['m1'])
+            // Each finished test as folder:name, in the order MATLAB ran them
+            const runOverWire = async (runId, testFiles, testNames) => {
+                notify('matlab/testing/run/request', { runId, testFiles, testNames })
+                const deadline = Date.now() + 60000
+                while (Date.now() < deadline &&
+                    !notifications.some(n => n.method === 'matlab/testing/run/complete' && n.params.runId === runId)) {
+                    await sleep(100)
+                }
+                return notifications
+                    .filter(n => n.method === 'matlab/testing/run/event' && n.params.runId === runId && n.params.event.type === 'finished')
+                    .map(n => path.basename(path.dirname(n.params.event.testFile)) + ':' + n.params.event.testName)
+            }
+
+            // The unreadable file comes first: an empty suite there once made the whole run empty
+            const missing = path.join(runDir, 'gone', 'TestRunGone.m')
+            const paired = await runOverWire('smoke-run-paired', [missing, inY, inX, inX],
+                ['TestRunGone/m1', 'TestRunSmoke/m1', 'TestRunSmoke/m2', 'TestRunSmoke/m3'])
+            check('a test run runs each name only in the file sent with it, file by file in the order sent, after a file that cannot be read',
+                JSON.stringify(paired.map(t => t.split(':')[0])) === JSON.stringify(['y', 'x', 'x']) &&
+                JSON.stringify([...paired].sort()) === JSON.stringify(['x:TestRunSmoke/m2', 'x:TestRunSmoke/m3', 'y:TestRunSmoke/m1']),
+                JSON.stringify(paired))
+
+            const whole = await runOverWire('smoke-run-whole', [inX])
+            check('a test run without names runs every test in its files',
+                JSON.stringify([...whole].sort()) === JSON.stringify(['x:TestRunSmoke/m1', 'x:TestRunSmoke/m2', 'x:TestRunSmoke/m3']),
+                JSON.stringify(whole))
+        } finally {
+            fs.rmSync(runDir, { recursive: true, force: true })
+        }
     }
 
     console.log('')
