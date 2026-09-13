@@ -42,6 +42,11 @@ class ClientCapabilitiesManager {
         return this.getCapabilities()?.workspace?.workspaceFolders === true
     }
 
+    /** Whether the client accepts a symbol tree (`DocumentSymbol[]`) from `textDocument/documentSymbol`. */
+    hasHierarchicalDocumentSymbolSupport (): boolean {
+        return this.getCapabilities()?.textDocument?.documentSymbol?.hierarchicalDocumentSymbolSupport === true
+    }
+
     /** Whether the client supports server-initiated `workspace/semanticTokens/refresh` requests. */
     hasSemanticTokensRefresh (): boolean {
         return this.getCapabilities()?.workspace?.semanticTokens?.refreshSupport === true

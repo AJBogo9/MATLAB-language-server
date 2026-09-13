@@ -119,6 +119,36 @@ describe('ClientCapabilitiesManager', () => {
         })
     })
 
+    describe('hasHierarchicalDocumentSymbolSupport', () => {
+        it('should return true when hierarchicalDocumentSymbolSupport is true', () => {
+            ClientCapabilitiesManager.initialize({
+                textDocument: { documentSymbol: { hierarchicalDocumentSymbolSupport: true } }
+            })
+
+            assert.strictEqual(ClientCapabilitiesManager.hasHierarchicalDocumentSymbolSupport(), true)
+        })
+
+        it('should return false when hierarchicalDocumentSymbolSupport is false', () => {
+            ClientCapabilitiesManager.initialize({
+                textDocument: { documentSymbol: { hierarchicalDocumentSymbolSupport: false } }
+            })
+
+            assert.strictEqual(ClientCapabilitiesManager.hasHierarchicalDocumentSymbolSupport(), false)
+        })
+
+        it('should return false when documentSymbol capabilities are not present', () => {
+            ClientCapabilitiesManager.initialize({
+                textDocument: { documentSymbol: {} }
+            })
+
+            assert.strictEqual(ClientCapabilitiesManager.hasHierarchicalDocumentSymbolSupport(), false)
+        })
+
+        it('should return false when not initialized', () => {
+            assert.strictEqual(ClientCapabilitiesManager.hasHierarchicalDocumentSymbolSupport(), false)
+        })
+    })
+
     describe('hasSemanticTokensRefresh', () => {
         it('should return true when refreshSupport is true', () => {
             ClientCapabilitiesManager.initialize({

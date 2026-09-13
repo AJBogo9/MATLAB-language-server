@@ -1,6 +1,6 @@
 // Copyright 2022 - 2025 The MathWorks, Inc.
 
-import { DefinitionParams, DocumentSymbolParams, Location, Range, ReferenceParams, SymbolInformation, SymbolKind, TextDocuments } from 'vscode-languageserver'
+import { DefinitionParams, DocumentSymbol, DocumentSymbolParams, Location, Range, ReferenceParams, SymbolInformation, SymbolKind, TextDocuments } from 'vscode-languageserver'
 import { TextDocument } from 'vscode-languageserver-textdocument'
 import FileInfoIndex, {
     FunctionContainer, MatlabClassdefInfo, MatlabClassInfo, MatlabCodeInfo, MatlabFunctionScopeInfo,
@@ -14,6 +14,8 @@ import MatlabLifecycleManager from '../../lifecycle/MatlabLifecycleManager'
 import Indexer from '../../indexing/Indexer'
 import DocumentIndexer from '../../indexing/DocumentIndexer'
 import PathResolver from './PathResolver'
+import { SymbolEntry, createSymbolEntry, nestSymbolEntries } from './DocumentSymbolTree'
+import ClientCapabilitiesManager from '../../lifecycle/ClientCapabilitiesManager'
 import NotificationService, { Notification } from '../../notifications/NotificationService'
 import * as SymbolSearchService from '../../indexing/SymbolSearchService'
 import { DocumentUri } from 'vscode-languageserver-types'
@@ -69,7 +71,7 @@ class NavigationSupportProvider {
      * @param requestType The type of request
      * @returns Array of symbols found in the document
      */
-    async handleDocumentSymbol (uri: DocumentUri, documentManager: TextDocuments<TextDocument>, requestType: RequestType): Promise<SymbolInformation[]> {
+    async handleDocumentSymbol (uri: DocumentUri, documentManager: TextDocuments<TextDocument>, requestType: RequestType): Promise<SymbolInformation[] | DocumentSymbol[]> {
         // Get or wait for the MATLAB connection to handle files opened before MATLAB is ready.
         // We do not want to trigger MATLAB to launch due to the frequency of this callback.
         // However, simply returning [] in this case could cause a delay between MATLAB started
@@ -108,18 +110,18 @@ class NavigationSupportProvider {
         }
 
         // Result symbols in document
-        const result: SymbolInformation[] = []
+        const entries: SymbolEntry[] = []
 
         /**
          * Push symbol info to result set
          */
-        function pushSymbol (name: string, kind: SymbolKind, symbolRange: Range): void {
-            result.push(SymbolInformation.create(name, kind, symbolRange, uri))
+        function pushSymbol (name: string, kind: SymbolKind, symbolRange: Range, nameRange?: Range): void {
+            entries.push(createSymbolEntry(name, kind, symbolRange, nameRange))
         }
 
         const classdef: MatlabClassdefInfo | undefined = codeInfo.globalScopeInfo.classScope?.classdefInfo
         if (classdef) {
-            pushSymbol(classdef.declarationNameId.name, SymbolKind.Class, classdef.range)
+            pushSymbol(classdef.declarationNameId.name, SymbolKind.Class, classdef.range, classdef.declarationNameId.range)
 
             const classInfo = classdef.classInfo
 
@@ -133,7 +135,8 @@ class NavigationSupportProvider {
         this._getAllFunctionScopesInFile(codeInfo).forEach(functionScopeInfo => pushSymbol(
             functionScopeInfo.declarationNameId.name,
             functionScopeInfo.functionInfo.isMethod ? SymbolKind.Method : SymbolKind.Function,
-            functionScopeInfo.range
+            functionScopeInfo.range,
+            functionScopeInfo.declarationNameId.range
         ))
 
         codeInfo.sections.forEach(sectionInfo => {
@@ -144,7 +147,11 @@ class NavigationSupportProvider {
 
         this._sendSectionRangesForHighlighting(codeInfo, uri)
 
-        return result
+        // A symbol tree lets the outline select a symbol's name rather than its first keyword
+        if (ClientCapabilitiesManager.hasHierarchicalDocumentSymbolSupport()) {
+            return nestSymbolEntries(entries)
+        }
+        return entries.map(entry => SymbolInformation.create(entry.name, entry.kind, entry.range, uri))
     }
 
     private _getAllFunctionScopesInFile (codeInfo: MatlabCodeInfo): MatlabFunctionScopeInfo[] {

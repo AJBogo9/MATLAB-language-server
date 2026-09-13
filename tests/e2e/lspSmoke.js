@@ -174,6 +174,7 @@ async function main () {
         capabilities: {
             textDocument: {
                 hover: { contentFormat: ['markdown', 'plaintext'] },
+                documentSymbol: { hierarchicalDocumentSymbolSupport: true },
                 synchronization: { dynamicRegistration: false }
             },
             workspace: { configuration: true, workspaceFolders: true }
@@ -296,7 +297,7 @@ async function main () {
         // --- the mechanism Run Section relies on: a documentSymbol request must
         // --- make the server recompute and push section ranges.
         const beforeCount = notifications.filter(n => n.method === 'matlab/sections').length
-        await request('textDocument/documentSymbol', { textDocument: { uri: DOC_URI } })
+        const symbolResp = await request('textDocument/documentSymbol', { textDocument: { uri: DOC_URI } })
         await sleep(1500)
         const sectionPushes = notifications.filter(n => n.method === 'matlab/sections')
         check('documentSymbol makes the server push section ranges',
@@ -308,6 +309,14 @@ async function main () {
                 Array.isArray(last.sectionRanges),
                 (last.sectionRanges || []).length + ' ranges for ' + (last.uri || '?').split('/').pop())
         }
+
+        // --- a client that accepts a tree gets one, with the name as the selection
+        const hoverSmokeSymbol = (symbolResp.result || []).find(s => s.name === 'hoverSmoke')
+        const selection = hoverSmokeSymbol && hoverSmokeSymbol.selectionRange
+        check('documentSymbol returns a tree with the name as the selection',
+            hoverSmokeSymbol !== undefined && hoverSmokeSymbol.location === undefined && selection !== undefined &&
+            selection.start.line === 0 && selection.start.character === 13 && selection.end.character === 23,
+            JSON.stringify(hoverSmokeSymbol))
 
         // --- workspace symbols (Ctrl+T) over the index the open document built
         const wsResp = await request('workspace/symbol', { query: 'hoverSmoke' })
