@@ -39,8 +39,10 @@ function isInsideFolder (filePath: string, folderPath: string): boolean {
 export default class WorkspaceIndexer {
     private isWorkspaceIndexingSupported = false
 
-    // Runs under way or waiting their turn. Runs go one at a time.
+    // Runs under way or waiting their turn. Runs go one at a time, except that a run
+    // whose crawl stalls lets the next one start.
     private readonly runs = new Set<IndexingRun>()
+    // Settles once the last queued run has finished or stalled
     private lastRun: Promise<void> = Promise.resolve()
 
     constructor (
@@ -144,20 +146,29 @@ export default class WorkspaceIndexer {
         }
         this.runs.add(run)
 
+        // A run starts once the run before it has finished, or has stalled on a file that
+        // parses for longer than the crawl's silence warning. The stalled crawl keeps its
+        // worker and carries on while this run takes another, so a slow or endless parse
+        // does not hold up the runs behind it. A crawl still waiting for a free worker never
+        // stalls, and holds up the runs behind it, since they could not start either.
         const previousRun = this.lastRun
-        const thisRun = (async () => {
+        let releaseQueue: () => void = () => {}
+        this.lastRun = new Promise<void>(resolve => { releaseQueue = resolve })
+        try {
             await previousRun
-            await this.run(run)
-        })()
-        this.lastRun = thisRun
-        await thisRun
+            await this.run(run, releaseQueue)
+        } finally {
+            releaseQueue()
+        }
     }
 
     /**
      * Walks the run's folders and has MATLAB parse the files found, showing progress
      * while it does. Never rejects.
+     *
+     * @param onStalled Called when the run's crawl stalls, to let the next run start
      */
-    private async run (run: IndexingRun): Promise<void> {
+    private async run (run: IndexingRun, onStalled: () => void): Promise<void> {
         let progress: WorkDoneProgressServerReporter | undefined
 
         try {
@@ -183,7 +194,8 @@ export default class WorkspaceIndexer {
                         progress?.report(percentage, `${filesDone}/${total} files`)
                     }
                 },
-                shouldStore: uri => this.shouldStore(run, uri)
+                shouldStore: uri => this.shouldStore(run, uri),
+                onStalled
             })
 
             if (result === 'done') {

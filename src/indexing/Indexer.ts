@@ -25,7 +25,8 @@ interface CrawlStartedResponse {
     isStarted: true
 }
 
-// Published when the crawl's future failed or was cancelled, before or during the crawl
+// Published when the crawl ends early: by the worker for an error it caught, or by an afterAll
+// callback on the MATLAB thread for a crawl that was cancelled or could not report itself
 interface CrawlFailedResponse {
     isFailed: true
     error: string
@@ -47,6 +48,9 @@ export interface CrawlOptions {
     onFileDone?: (uri: string) => void
     // Whether a parsed file may replace what the index holds for it
     shouldStore?: (uri: string) => boolean
+    // Called once, when the crawl first goes CRAWL_SILENCE_WARNING_MS without a file after a
+    // worker started it. The crawl carries on. A crawl waiting for a free worker never stalls.
+    onStalled?: () => void
 }
 
 interface DocumentParseResponse {
@@ -164,10 +168,16 @@ export default class Indexer {
      * only once, however long the crawl takes. The crawl waits for a free worker, and for
      * each file to parse, for as long as that takes. It ends once every file was reported
      * on, when the request or its future fails, or when MATLAB disconnects. A file that
-     * brings no result for CRAWL_SILENCE_WARNING_MS is named in a warning.
+     * brings no result for CRAWL_SILENCE_WARNING_MS is named in a warning, and the first
+     * such warning reports the crawl as stalled.
+     *
+     * A crawl given up because its request failed while MATLAB is still ready is
+     * cancelled in MATLAB. A crawl given up for a disconnect is not: a local MATLAB is
+     * shut down, which ends its futures, and a remote one (matlabUrl) cannot be reached,
+     * so its crawl runs to its end with nobody listening.
      *
      * @param filePaths The absolute paths of the files
-     * @param options Hooks for reporting progress and for declining results
+     * @param options Hooks for reporting progress and a stall, and for declining results
      * @returns 'done' once every file was reported on, 'aborted' if the request or its
      * future failed or MATLAB disconnected, or 'unavailable' if MATLAB is not there to crawl
      */
@@ -189,6 +199,7 @@ export default class Indexer {
 
         return await new Promise<CrawlResult>(resolve => {
             let isSettled = false
+            let hasStalled = false
             let silenceTimer: NodeJS.Timeout | undefined
 
             const settle = (result: CrawlResult): void => {
@@ -203,17 +214,38 @@ export default class Indexer {
             }
             const abort = (): void => settle('aborted')
 
+            // Gives the crawl up after its request failed. MATLAB may have queued the crawl
+            // before the failure, so while MATLAB is still ready the crawl is cancelled there.
+            // The cancel is sent after the crawl request, so a crawl MATLAB queued is recorded
+            // by then. A crawl already over is left alone: it finished, MATLAB reported it
+            // failed, or it was given up for a disconnect, after which a ready MATLAB may be
+            // another session.
+            const giveUpRequest = (): void => {
+                if (isSettled) {
+                    return
+                }
+                settle('aborted')
+                if (this.mvm.isReady()) {
+                    this.cancelCrawlInMatlab(channel)
+                }
+            }
+
             // MATLAB publishes the files in list order, so this also indexes the file it is on
             let filesReceived = 0
 
             // Armed once a worker has started the crawl, so neither time spent waiting for
             // the MATLAB thread nor time spent waiting for a free worker counts. It warns once
             // per silent stretch and never gives the crawl up: a large generated file can
-            // parse for minutes, and giving up would lose every file after it.
+            // parse for minutes, and giving up would lose every file after it. The first
+            // warning reports the crawl as stalled, so that other crawls need not wait for it.
             const restartSilenceTimer = (): void => {
                 clearTimeout(silenceTimer)
                 silenceTimer = setTimeout(() => {
                     Logger.warn(`No workspace indexing result for ${CRAWL_SILENCE_WARNING_MS} ms while MATLAB parses ${filePaths[filesReceived]}. Indexing continues.`)
+                    if (!hasStalled) {
+                        hasStalled = true
+                        options.onStalled?.()
+                    }
                 }, CRAWL_SILENCE_WARNING_MS)
             }
 
@@ -263,11 +295,11 @@ export default class Indexer {
             ).then(response => {
                 if ('error' in response) {
                     Logger.error(`Error received while indexing the workspace: ${response.error.msg as string}`)
-                    settle('aborted')
+                    giveUpRequest()
                 }
             }, err => {
                 Logger.error(`Error caught while indexing the workspace: ${String(err)}`)
-                settle('aborted')
+                giveUpRequest()
             })
         })
     }
@@ -294,6 +326,22 @@ export default class Indexer {
         }
 
         this.fileInfoIndex.parseAndStoreCodeInfo(uri, codeInfo)
+    }
+
+    /**
+     * Asks MATLAB to cancel the crawl that publishes on the channel, without waiting for
+     * the answer, so that the crawl does not keep a pool worker busy for nobody.
+     *
+     * @param channel The crawl's response channel
+     */
+    private cancelCrawlInMatlab (channel: string): void {
+        this.mvm.feval('matlabls.handlers.indexing.cancelCrawl', 0, [channel]).then(response => {
+            if ('error' in response) {
+                Logger.warn(`Unable to cancel a workspace crawl in MATLAB: ${response.error.msg as string}`)
+            }
+        }, err => {
+            Logger.warn(`Unable to cancel a workspace crawl in MATLAB: ${String(err)}`)
+        })
     }
 
     /**

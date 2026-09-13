@@ -4,9 +4,12 @@
  * language server over stdio with workspace folders on a scratch tree that holds
  * symbolic link loops, a duplicated folder, a broken link, an unreadable file and
  * generated folders, then checks what workspace/symbol returns, the progress the
- * server reports, and what happens when folders are added and removed. Last, a
+ * server reports, and what happens when folders are added and removed. Then a
  * folder is added while every background pool worker is busy for longer than the
- * crawl's silence warning time, and its crawl must still finish.
+ * crawl's silence warning time, and its crawl must still finish. Last, a folder
+ * whose only file parses for longer than the silence warning time is added, and a
+ * folder added once that crawl has stalled must be crawled while it still parses.
+ * The stalled crawl is then cancelled in MATLAB, which must end it at once.
  *
  * Before the Node walk, MATLAB's dir('**') listed each file under the looping link
  * up to 40 times over, and on the folder with two loops it did not return at all.
@@ -25,11 +28,13 @@ const REPO = path.resolve(__dirname, '..', '..', '..')
 const SERVER = path.join(REPO, 'server', 'out', 'index.js')
 const rootArg = process.argv.find(a => a.startsWith('--matlabRoot='))
 const MATLAB_INSTALL_PATH = rootArg ? rootArg.slice('--matlabRoot='.length) : '/usr/local/MATLAB/R2026a'
-const HARD_TIMEOUT_MS = 6 * 60 * 1000
+const HARD_TIMEOUT_MS = 10 * 60 * 1000
 const PROGRESS_TITLE = 'Indexing MATLAB files'
 // CRAWL_SILENCE_WARNING_MS in src/indexing/Indexer.ts, and how long the pool stays busy past it
 const CRAWL_SILENCE_WARNING_MS = 60000
 const POOL_BUSY_S = 80
+// A generated function this long parses on a worker for longer than CRAWL_SILENCE_WARNING_MS
+const SLOW_FILE_LINES = 16000
 
 // VS Code's defaults for the two settings
 const FILES_EXCLUDE_DEFAULTS = { '**/.git': true, '**/.svn': true, '**/.hg': true, '**/.DS_Store': true, '**/Thumbs.db': true }
@@ -83,6 +88,18 @@ function buildTree () {
     // Folder E: added while every background pool worker is busy
     writeFunction('E/efn.m', 'efn')
     writeFunction('E/sub/esub.m', 'esub')
+
+    // Folder S: one generated function that parses for longer than the silence warning time
+    const lines = ['function out = slowGen(in1)', 't1 = in1(1).*in1(2);', 't2 = t1.^2+in1(3);']
+    for (let k = 3; k <= SLOW_FILE_LINES; k++) {
+        lines.push(`t${k} = t${k - 1}.*in1(2)+t${k - 2}.^2-in1(3)./t${k - 1};`)
+    }
+    lines.push(`out = t${SLOW_FILE_LINES};`, 'end', '')
+    fs.mkdirSync(path.join(scratch, 'S'))
+    fs.writeFileSync(path.join(scratch, 'S', 'slowGen.m'), lines.join('\n'))
+
+    // Folder G: added once the crawl of S has stalled
+    writeFunction('G/gfn.m', 'gfn')
 }
 
 const folderOf = name => ({ uri: pathToFileURL(path.join(scratch, name)).href, name })
@@ -90,6 +107,8 @@ const A = folderOf('A')
 const B = folderOf('B')
 const C = folderOf('C')
 const E = folderOf('E')
+const S = folderOf('S')
+const G = folderOf('G')
 // A folder URI that ends in a slash, as a drive root's always does: its files must still be stored and dropped
 const D = { uri: `${folderOf('D').uri}/`, name: 'D' }
 let workspaceFolders = [A, C, D]
@@ -313,6 +332,66 @@ async function main () {
     }
     const eIndexed = await waitFor(async () => (await symbolUris('efn')).length === 1 && (await symbolUris('esub')).length === 1, 10 * 1000)
     check('the folder added while the pool was busy is indexed', eIndexed)
+
+    // --- adding S, whose only file parses for longer than the silence warning time, and
+    // --- then G once that crawl has stalled: G is crawled and indexed while S still parses
+    workspaceFolders = [A, C, B, E, S]
+    notify('workspace/didChangeWorkspaceFolders', { event: { added: [S], removed: [] } })
+    const slowBegun = await waitFor(() => tokens().length >= 4, 60 * 1000)
+    check('adding a folder with a slow file starts its crawl', slowBegun, `${tokens().length} progress tokens`)
+    if (!slowBegun) return
+    const slowToken = tokens()[3]
+    const stallWarning = new RegExp(`No workspace indexing result for ${CRAWL_SILENCE_WARNING_MS} ms while MATLAB parses \\S*/S/slowGen\\.m`)
+    const stalled = await waitFor(() => stallWarning.test(serverLog()), CRAWL_SILENCE_WARNING_MS + 60 * 1000)
+    const stalledAt = Date.now() - t0
+    check('the slow crawl warns that MATLAB still parses slowGen.m', stalled, `seen ${((stalledAt - timeOf(slowToken, 'begin')) / 1000).toFixed(1)} s after its progress began`)
+    if (!stalled) return
+
+    workspaceFolders = [A, C, B, E, S, G]
+    notify('workspace/didChangeWorkspaceFolders', { event: { added: [G], removed: [] } })
+    const gEnded = await waitFor(() => tokens().length >= 5 && eventsOf(tokens()[4]).some(e => e.kind === 'end'), 30 * 1000)
+    const slowStillParsing = !eventsOf(slowToken).some(e => e.kind === 'end')
+    check('a folder added once a crawl stalls is crawled while the stalled crawl still parses', gEnded && slowStillParsing,
+        gEnded ? `ended ${((timeOf(tokens()[4], 'end') - stalledAt) / 1000).toFixed(1)} s after it was added; the slow crawl ${slowStillParsing ? 'had not ended' : 'had already ended'}` : `no end within 30 s (${tokens().length} progress tokens)`)
+    if (gEnded) {
+        checkProgress('folder added while a crawl stalls', tokens()[4], 1)
+    }
+    check('that folder is indexed and the slow file is not yet', (await symbolUris('gfn')).length === 1 && (await symbolUris('slowGen')).length === 0)
+
+    // --- cancelling the stalled crawl in MATLAB, as the server does when it gives a crawl up
+    // --- while MATLAB is ready, frees its worker, and the report of it ends the progress
+    const cancelledAt = Date.now() - t0
+    const cancelled = await fevalOverWire('evalin', 0, ['base', "indexingSmokeChannels = matlabls.handlers.indexing.crawlFutures('channels'); for k = 1:numel(indexingSmokeChannels), matlabls.handlers.indexing.cancelCrawl(indexingSmokeChannels{k}); end"])
+    const slowEnded = await waitFor(() => eventsOf(slowToken).some(e => e.kind === 'end'), 20 * 1000)
+    const slowPercentages = eventsOf(slowToken).filter(e => e.kind === 'report').map(e => e.percentage)
+    check('cancelling the stalled crawl in MATLAB ends its progress without 100', slowEnded && !slowPercentages.includes(100),
+        `${slowEnded ? `ended ${((timeOf(slowToken, 'end') - cancelledAt) / 1000).toFixed(1)} s after the cancel was sent` : 'no end within 20 s'}; percentages ${JSON.stringify(slowPercentages)}; cancel ${JSON.stringify(cancelled)}`)
+    check('the server logs the cancellation MATLAB reported', /Workspace indexing failed in MATLAB: Execution of the future was cancelled/.test(serverLog()))
+    // indexingSmokePool was set to backgroundPool when the pool was filled
+    const futures = await fevalOverWire('evalin', 1, ['base', 'numel(indexingSmokePool.FevalQueue.RunningFutures) + numel(indexingSmokePool.FevalQueue.QueuedFutures)'])
+    const flatten = value => Array.isArray(value) ? value.flatMap(flatten) : [value]
+    check('the cancelled crawl holds no worker', futures !== undefined && JSON.stringify(flatten(futures.result)) === '[0]', `futures queued or running: ${JSON.stringify(futures)}`)
+}
+
+/** The server's log so far. */
+function serverLog () {
+    const prefix = `matlabls_${child.pid}`
+    return fs.readdirSync(os.tmpdir())
+        .filter(name => name === prefix || name.startsWith(`${prefix}_`))
+        .map(name => {
+            try {
+                return fs.readFileSync(path.join(os.tmpdir(), name, 'languageServerLog.txt'), 'utf8')
+            } catch {
+                return ''
+            }
+        })
+        .join('\n')
+}
+
+/** When the progress of the token first reported an event of the kind. */
+function timeOf (token, kind) {
+    const event = progress.find(p => p.token === token && p.value.kind === kind)
+    return event === undefined ? NaN : event.at
 }
 
 async function finish (code) {

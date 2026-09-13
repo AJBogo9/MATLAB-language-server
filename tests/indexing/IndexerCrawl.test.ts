@@ -22,6 +22,7 @@ const F_1 = require('./rawCodeDataResourceFiles/improvedCodeAnalysisSpecCases/fu
 const F_2 = require('./rawCodeDataResourceFiles/improvedCodeAnalysisSpecCases/functionCases/F_2.json')
 
 const CRAWL_HANDLER = 'matlabls.handlers.indexing.parseInfoFromFiles'
+const CANCEL_HANDLER = 'matlabls.handlers.indexing.cancelCrawl'
 const uriOf = (filePath: string): string => URI.file(filePath).toString()
 
 /** A MATLAB connection whose channel IDs count up, as the real one does, and which delivers by channel. */
@@ -95,8 +96,11 @@ describe('Indexer workspace crawl', () => {
     let indexer: Indexer
     let fake: { connection: any, deliver: (channel: string, message: any) => void }
     let fevalReply: () => Promise<any>
+    let cancelReply: () => Promise<any>
 
     const crawlCalls = (): sinon.SinonSpyCall[] => mockMvm.feval.getCalls().filter((call: sinon.SinonSpyCall) => call.args[0] === CRAWL_HANDLER)
+    const cancelCalls = (): sinon.SinonSpyCall[] => mockMvm.feval.getCalls().filter((call: sinon.SinonSpyCall) => call.args[0] === CANCEL_HANDLER)
+    const warnings = (): string[] => (Logger.warn as sinon.SinonStub).getCalls().map(call => String(call.args[0]))
     const channelOf = (call: sinon.SinonSpyCall): string => call.args[2][2]
     const pathsOf = (call: sinon.SinonSpyCall): string[] => call.args[2][0].mwdata
     const storedFunctions = (filePath: string): string[] =>
@@ -122,9 +126,13 @@ describe('Indexer workspace crawl', () => {
         sinon.stub(lifecycle, 'getMatlabConnection').resolves(fake.connection)
 
         fevalReply = async () => ({ result: [] })
+        cancelReply = async () => ({ result: [] })
         mockMvm.feval.callsFake(async (name: string) => {
             if (name === CRAWL_HANDLER) {
                 return await fevalReply()
+            }
+            if (name === CANCEL_HANDLER) {
+                return await cancelReply()
             }
             throw new Error(`unexpected feval ${name}`)
         })
@@ -513,6 +521,122 @@ describe('Indexer workspace crawl', () => {
         assert.strictEqual(await settleWithin(crawlA, 1000), 'done')
         assert.deepStrictEqual(reportedA, [uriOf('/a/1.m'), uriOf('/a/2.m')])
         assert.deepStrictEqual(reportedB, [uriOf('/b/1.m')])
+    })
+
+    it('reports a stall once, when the first silence warning fires, and keeps the crawl going', async () => {
+        const onStalled = sinon.spy()
+        const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+        let crawl: Promise<string> | undefined
+        try {
+            crawl = indexer.indexFiles(['/w/a.m', '/w/b.m'], { onStalled })
+            await waitUntil(() => crawlCalls().length === 1)
+            await new Promise(resolve => setImmediate(resolve))
+            const channel = channelOf(crawlCalls()[0])
+
+            // Waiting for the MATLAB thread or for a free worker is no stall
+            clock.tick(2 * CRAWL_SILENCE_WARNING_MS)
+            sinon.assert.notCalled(onStalled)
+
+            fake.deliver(channel, { isStarted: true })
+            clock.tick(CRAWL_SILENCE_WARNING_MS - 1)
+            sinon.assert.notCalled(onStalled)
+            clock.tick(1)
+            sinon.assert.calledOnce(onStalled)
+            assert.strictEqual(silenceWarnings().length, 1)
+
+            // A later silent stretch warns again, but the stall was already reported
+            fake.deliver(channel, { filePath: '/w/a.m', isDone: false, codeData: F_1 })
+            clock.tick(CRAWL_SILENCE_WARNING_MS)
+            assert.strictEqual(silenceWarnings().length, 2)
+            sinon.assert.calledOnce(onStalled)
+
+            assert.ok(await isStillPending(crawl), 'a stall does not end the crawl')
+            fake.deliver(channel, { filePath: '/w/b.m', isDone: true, codeData: F_2 })
+        } finally {
+            clock.restore()
+        }
+
+        assert.strictEqual(await settleWithin(crawl, 1000), 'done')
+        assert.deepStrictEqual(storedFunctions('/w/a.m'), ['fun'])
+        assert.deepStrictEqual(storedFunctions('/w/b.m'), ['f1', 'f2'])
+        sinon.assert.calledOnce(onStalled)
+    })
+
+    it('asks MATLAB to cancel the crawl, without waiting for the answer, when MATLAB reports an error for the request', async () => {
+        fevalReply = async () => ({ error: { msg: 'Undefined function afterAll' } })
+        // MATLAB never answers the cancel
+        cancelReply = async () => await new Promise(() => {})
+
+        assert.strictEqual(await settleWithin(indexer.indexFiles(['/w/a.m']), 100), 'aborted')
+        assert.strictEqual(cancelCalls().length, 1)
+        assert.deepStrictEqual(cancelCalls()[0].args, [CANCEL_HANDLER, 0, [channelOf(crawlCalls()[0])]])
+    })
+
+    it('asks MATLAB to cancel the crawl when the request fails while MATLAB is still ready', async () => {
+        fevalReply = async () => { throw new Error('request lost') }
+
+        assert.strictEqual(await settleWithin(indexer.indexFiles(['/w/a.m']), 100), 'aborted')
+        assert.strictEqual(cancelCalls().length, 1)
+        assert.deepStrictEqual(cancelCalls()[0].args[2], [channelOf(crawlCalls()[0])])
+    })
+
+    it('does not ask MATLAB to cancel a crawl once MATLAB is not ready', async () => {
+        fevalReply = async () => {
+            mockMvm.isReady.returns(false)
+            throw new Error('MVM gone')
+        }
+
+        assert.strictEqual(await settleWithin(indexer.indexFiles(['/w/a.m']), 100), 'aborted')
+        assert.strictEqual(cancelCalls().length, 0)
+    })
+
+    it('does not ask MATLAB to cancel a crawl that had already ended when its request failed', async () => {
+        const answers = [deferred<unknown>(), deferred<unknown>(), deferred<unknown>()]
+        let rejectLast: (err: Error) => void = () => {}
+        const lastAnswer = new Promise<unknown>((_resolve, reject) => { rejectLast = reject })
+        let requests = 0
+        fevalReply = async () => {
+            const n = requests++
+            return n < 2 ? await answers[n].promise : await lastAnswer
+        }
+
+        // Finished
+        const done = indexer.indexFiles(['/w/a.m'])
+        await waitUntil(() => crawlCalls().length === 1)
+        fake.deliver(channelOf(crawlCalls()[0]), { filePath: '/w/a.m', isDone: true, codeData: F_1 })
+        assert.strictEqual(await settleWithin(done, 1000), 'done')
+
+        // Reported as failed by MATLAB
+        const failed = indexer.indexFiles(['/w/a.m'])
+        await waitUntil(() => crawlCalls().length === 2)
+        fake.deliver(channelOf(crawlCalls()[1]), { isFailed: true, error: 'Out of memory.' })
+        assert.strictEqual(await settleWithin(failed, 1000), 'aborted')
+
+        // Given up for a disconnect, after which MATLAB may be ready again
+        const disconnected = indexer.indexFiles(['/w/a.m'])
+        await waitUntil(() => crawlCalls().length === 3)
+        lifecycle.eventEmitter.emit('disconnected')
+        assert.strictEqual(await settleWithin(disconnected, 1000), 'aborted')
+
+        answers[0].resolve({ error: { msg: 'late error' } })
+        answers[1].resolve({ error: { msg: 'late error' } })
+        rejectLast(new Error('late rejection'))
+        for (let i = 0; i < 10; i++) {
+            await new Promise(resolve => setImmediate(resolve))
+        }
+        assert.strictEqual(cancelCalls().length, 0)
+    })
+
+    it('logs a cancel MATLAB could not carry out, and still gives the crawl up', async () => {
+        fevalReply = async () => ({ error: { msg: 'boom' } })
+
+        cancelReply = async () => { throw new Error('cancel lost') }
+        assert.strictEqual(await settleWithin(indexer.indexFiles(['/w/a.m']), 100), 'aborted')
+        await waitUntil(() => warnings().some(message => message.includes('cancel lost')))
+
+        cancelReply = async () => ({ error: { msg: 'Undefined function cancelCrawl' } })
+        assert.strictEqual(await settleWithin(indexer.indexFiles(['/w/a.m']), 100), 'aborted')
+        await waitUntil(() => warnings().some(message => message.includes('Undefined function cancelCrawl')))
     })
 
     describe('of a class folder', function () {

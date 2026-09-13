@@ -19,6 +19,7 @@ interface CrawlOptions {
     onStart?: () => Promise<void>
     onFileDone?: (uri: string) => void
     shouldStore?: (uri: string) => boolean
+    onStalled?: () => void
 }
 
 interface Crawl {
@@ -360,6 +361,99 @@ describe('WorkspaceIndexer', function () {
         await startAndReportAll(crawls[1])
         sinon.assert.calledTwice(connection.window.createWorkDoneProgress)
         await crawls[1].finish('done')
+    })
+
+    it('starts the next queued crawl once the running crawl stalls, and still shows and ends the stalled one', async () => {
+        write('slow/a.m')
+        write('slow/b.m')
+        write('two/c.m')
+        connection.workspace.getWorkspaceFolders.resolves([folder('slow')])
+
+        const indexing = workspaceIndexer.indexWorkspace()
+        await waitUntil(() => crawls.length === 1)
+        const stalled = crawls[0]
+        await startAndReportAll(stalled, 1)
+
+        folderChangeHandler?.({ added: [folder('two')], removed: [] })
+        await flush()
+        assert.strictEqual(crawls.length, 1, 'the second crawl waits while the first is under way')
+
+        stalled.options.onStalled?.()
+        await waitUntil(() => crawls.length === 2)
+        assert.deepStrictEqual(crawls[1].filePaths, [path.join(root, 'two/c.m')])
+        await startAndReportAll(crawls[1])
+        await crawls[1].finish('done')
+        assert.deepStrictEqual(reporters[1].report.lastCall.args, [100, '1/1 files'])
+        sinon.assert.calledOnce(reporters[1].done)
+
+        // The stalled crawl keeps its progress and ends as any other
+        sinon.assert.notCalled(reporters[0].done)
+        stalled.options.onFileDone?.(URI.file(stalled.filePaths[1]).toString())
+        await stalled.finish('done')
+        await indexing
+        assert.deepStrictEqual(reporters[0].report.lastCall.args, [100, '2/2 files'])
+        sinon.assert.calledOnce(reporters[0].done)
+        assert.strictEqual((workspaceIndexer as any).runs.size, 0)
+    })
+
+    it('keeps a stalled crawl tracked, so it does not store a folder removed while it stalls', async () => {
+        write('slow/a.m')
+        write('two/c.m')
+        connection.workspace.getWorkspaceFolders.resolves([folder('slow')])
+
+        const indexing = workspaceIndexer.indexWorkspace()
+        await waitUntil(() => crawls.length === 1)
+        const stalled = crawls[0]
+        await startAndReportAll(stalled, 0)
+        stalled.options.onStalled?.()
+        folderChangeHandler?.({ added: [folder('two')], removed: [] })
+        await waitUntil(() => crawls.length === 2)
+
+        const uri = URI.file(path.join(root, 'slow/a.m')).toString()
+        const shouldStore = stalled.options.shouldStore as (uri: string) => boolean
+        assert.strictEqual(shouldStore(uri), true)
+        connection.workspace.getWorkspaceFolders.resolves([folder('two')])
+        folderChangeHandler?.({ added: [], removed: [folder('slow')] })
+        await flush()
+        assert.strictEqual(shouldStore(uri), false)
+
+        await crawls[1].finish('done')
+        await stalled.finish('done')
+        await indexing
+    })
+
+    it('makes a crawl queued behind a released one wait for that one, not for the stalled crawl', async () => {
+        write('one/a.m')
+        write('two/b.m')
+        write('three/c.m')
+        connection.workspace.getWorkspaceFolders.resolves([folder('one')])
+
+        const indexing = workspaceIndexer.indexWorkspace()
+        await waitUntil(() => crawls.length === 1)
+        await startAndReportAll(crawls[0], 0)
+        folderChangeHandler?.({ added: [folder('two')], removed: [] })
+        await flush()
+        folderChangeHandler?.({ added: [folder('three')], removed: [] })
+        await flush()
+
+        crawls[0].options.onStalled?.()
+        await waitUntil(() => crawls.length === 2)
+        await flush()
+        assert.strictEqual(crawls.length, 2, 'the third crawl waits for the second')
+        assert.deepStrictEqual(crawls[1].filePaths, [path.join(root, 'two/b.m')])
+
+        // Neither a second stall nor the end of the first crawl starts the third
+        crawls[0].options.onStalled?.()
+        await crawls[0].finish('done')
+        await indexing
+        assert.strictEqual(crawls.length, 2, 'the third crawl still waits for the second')
+
+        await startAndReportAll(crawls[1], 0)
+        crawls[1].options.onStalled?.()
+        await waitUntil(() => crawls.length === 3)
+        assert.deepStrictEqual(crawls[2].filePaths, [path.join(root, 'three/c.m')])
+        await crawls[1].finish('done')
+        await crawls[2].finish('done')
     })
 
     it('crawls each file of nested workspace folders once', async () => {
