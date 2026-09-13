@@ -418,6 +418,45 @@ async function main () {
         }
         check('the large document is indexed', indexed.length > 0,
             indexed.map(s => s.name).join(', ') || '(not found)')
+
+        // --- a stack frame from the terminal resolves to its file over the real MVM
+        // --- wire, the way the client asks, without changing MATLAB's current folder
+        const fevalOverWire = async (functionName, nargout, fevalArgs) => {
+            const requestId = 'smoke-feval-' + (nextId++)
+            notify('fevalRequest', { requestId, functionName, nargout, args: fevalArgs, isUserEval: false })
+            const deadline = Date.now() + 20000
+            for (;;) {
+                const reply = notifications.find(n => n.method === 'fevalResponse' && n.params.requestId === requestId)
+                if (reply !== undefined) return reply.params.result
+                if (Date.now() > deadline) return undefined
+                await sleep(50)
+            }
+        }
+        const fs = require('fs')
+        const frameDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'stackFrameSmoke-'))
+        try {
+            fs.mkdirSync(path.join(frameDir, '+sfsmoke'))
+            fs.writeFileSync(path.join(frameDir, '+sfsmoke', 'sfSmokeFn.m'),
+                "function sfSmokeFn\n    host();\nend\n\nfunction host\n    error('sf:smoke', 'smoke');\nend\n")
+            await fevalOverWire('addpath', 0, [frameDir])
+            const before = await fevalOverWire('pwd', 1, [])
+            const resolved = await fevalOverWire('matlabls.handlers.terminal.resolveStackFrame', 1,
+                ['sfsmoke.sfSmokeFn>host', 'sfsmoke.sfSmokeFn'])
+            const after = await fevalOverWire('pwd', 1, [])
+            await fevalOverWire('rmpath', 0, [frameDir])
+
+            const resolvedPath = resolved && Array.isArray(resolved.result) ? resolved.result[0] : undefined
+            check('a stack frame resolves to its file over the MVM wire',
+                typeof resolvedPath === 'string' && resolvedPath.endsWith(path.join('+sfsmoke', 'sfSmokeFn.m')),
+                JSON.stringify(resolved))
+            // Each reply carries its own requestID, so compare only the folder
+            const folderOf = reply => reply && Array.isArray(reply.result) ? reply.result[0] : undefined
+            check('resolving a stack frame leaves the current folder alone',
+                typeof folderOf(before) === 'string' && folderOf(before) === folderOf(after),
+                folderOf(before) + ' -> ' + folderOf(after))
+        } finally {
+            fs.rmSync(frameDir, { recursive: true, force: true })
+        }
     }
 
     console.log('')
