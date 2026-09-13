@@ -17,6 +17,9 @@ import { escapeMarkdown } from './DocCommentMarkdown'
 import { getOperatorHelp, findOperatorAtPosition, isReservedKeyword } from './OperatorHelp'
 import { buildOfflineSymbolInfo, renderArgumentsTable, OfflineSymbolInfo } from './OfflineHoverBuilder'
 import HoverCache from './HoverCache'
+import { renderArgumentDescriptions } from '../argumentDocs/ArgumentDescriptionMarkdown'
+import ArgumentDocSource from '../argumentDocs/ArgumentDocSource'
+import { isLocalName } from '../argumentDocs/LocalNames'
 
 /**
  * Raw hover payload returned by matlabls.handlers.hover.getHoverData.
@@ -67,7 +70,8 @@ class HoverSupportProvider {
     constructor (
         private readonly matlabLifecycleManager: MatlabLifecycleManager,
         private readonly mvm: MVM,
-        private readonly fileInfoIndex: FileInfoIndex
+        private readonly fileInfoIndex: FileInfoIndex,
+        private readonly argumentDocs = new ArgumentDocSource()
     ) {}
 
     /**
@@ -157,10 +161,14 @@ class HoverSupportProvider {
 
         const offline = buildOfflineSymbolInfo(text, expression.unqualifiedTarget)
 
-        // Never run help() on something the index says is a variable.
-        if (classified?.classification === SymbolClassification.Variable) {
+        // Never run help() on something the index says is a variable. Without an index, an argument
+        // of the enclosing function is one as well: inside its function it shadows any function of
+        // that name, and help('factor') describes prime factorization.
+        if (classified?.classification === SymbolClassification.Variable ||
+            (classified == null && this.declaresArgument(text, lines, line, topic))) {
+            // The dotted target, so hovering Method in opts.Method finds the opts.Method declaration
             return this.toHover(
-                this.renderVariableCard(expression.unqualifiedTarget, text, expression.unqualifiedTarget, line),
+                this.renderVariableCard(expression.unqualifiedTarget, text, topic, line),
                 hoverRange
             )
         }
@@ -190,9 +198,21 @@ class HoverSupportProvider {
         // shares its last part with a function declared here, unless the qualifier is the
         // class this document declares.
         const declared = offline != null && declaresTopic(text, topic, offline.name) ? offline : null
+
+        // A call into another file is described by that file's declaration, as one here would be.
+        // Without the index, only a name that can be a call looks there, or a local variable named
+        // like a file in this folder would get that file's card.
+        const external = declared == null && mayCallFunction(classified?.classification, lines, topic)
+            ? await this.argumentDocs.findDefinition(topic, hoverData, uri, documentManager)
+            : null
+        if (isCancelled(token)) {
+            return null
+        }
+
+        const described = declared ?? external?.info ?? null
         const helpIsForThisFile = hoverData?.whichPath != null && hoverData.whichPath !== '' &&
-            URI.parse(uri).fsPath === hoverData.whichPath
-        const markdown = this.renderSymbolCard(topic, hoverData, declared, helpIsForThisFile)
+            (external?.path ?? URI.parse(uri).fsPath) === hoverData.whichPath
+        const markdown = this.renderSymbolCard(topic, hoverData, described, helpIsForThisFile)
 
         if (markdown === '') {
             return null
@@ -309,6 +329,10 @@ class HoverSupportProvider {
 
             if (declarations.length > 0) {
                 parts.push('', '```matlab', renderArgumentsTable(declarations), '```')
+                const descriptions = renderArgumentDescriptions(declarations)
+                if (descriptions !== '') {
+                    parts.push('', descriptions)
+                }
 
                 const first = declarations[0].line + 1
                 const last = declarations[declarations.length - 1].line + 1
@@ -341,6 +365,15 @@ class HoverSupportProvider {
             }
         }
         return null
+    }
+
+    /**
+     * Whether the function enclosing a line declares an argument of this name, or name-value fields
+     * under it, in an arguments block.
+     */
+    private declaresArgument (documentText: string, lines: string[], line: number, name: string): boolean {
+        const info = buildOfflineSymbolInfo(documentText, this.findEnclosingFunctionName(lines, line) ?? '')
+        return info?.argumentDeclarations.some(d => d.name === name || d.name.startsWith(name + '.')) === true
     }
 
     /**
@@ -388,6 +421,12 @@ class HoverSupportProvider {
         const argumentsTable = offline != null ? renderArgumentsTable(offline.argumentDeclarations) : ''
         if (argumentsTable !== '') {
             parts.push('', '**Arguments**', '', '```matlab', argumentsTable, '```')
+        }
+
+        // Below the table as prose: a fence cannot hold the markdown rules comments render with
+        const argumentDescriptions = offline != null ? renderArgumentDescriptions(offline.argumentDeclarations) : ''
+        if (argumentDescriptions !== '') {
+            parts.push('', argumentDescriptions)
         }
 
         // What help() says about another file does not describe a symbol declared here
@@ -505,6 +544,20 @@ function declaresTopic (documentText: string, topic: string, name: string): bool
     }
     const parts = topic.split('.')
     return parts.length === 2 && parts[1] === name && buildOfflineSymbolInfo(documentText, parts[0])?.kind === 'classdef'
+}
+
+/**
+ * Whether a topic can be a call to a function in another file. The index knows. Without it, a name
+ * the document assigns or takes as a parameter is a variable, and so is a qualified name on one.
+ *
+ * @param classification What the index says, or undefined without an index
+ * @param lines The document split into lines
+ * @param topic The hovered topic
+ * @returns True when another file may describe the topic
+ */
+function mayCallFunction (classification: SymbolClassification | undefined, lines: string[], topic: string): boolean {
+    return classification === SymbolClassification.FunctionOrUnbound ||
+        (classification === undefined && !isLocalName(lines, topic.split('.')[0]))
 }
 
 /**

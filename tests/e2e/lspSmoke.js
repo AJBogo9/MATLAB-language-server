@@ -264,6 +264,58 @@ async function main () {
             own.contents.value.includes('mustBeFinite') ? 'present' : own.contents.value.slice(0, 120))
     }
 
+    // --- argument descriptions come from the arguments block comments, with or without MATLAB
+    const ARGDOC_URI = 'file:///tmp/argDocsSmoke/argDocsSmokeDemo.m'
+    const ARGDOC_TEXT = [
+        'function y = argDocsSmokeDemo(x, factor, opts)',                     // 0
+        '    %ARGDOCSSMOKEDEMO Scale a signal.',                               // 1
+        '    arguments',                                                       // 2
+        '        x (:,1) double           % the input signal',                 // 3
+        '        % the scale factor, applied to every sample',                 // 4
+        '        factor (1,1) double = 2',                                     // 5
+        '        opts.Method (1,1) string = "lin"   % interpolation method',   // 6
+        '        opts.Tol (1,1) double = 1e-6',                                // 7
+        '    end',                                                             // 8
+        '    y = x * factor;',                                                 // 9
+        'end'                                                                  // 10
+    ].join('\n')
+    notify('textDocument/didOpen', {
+        textDocument: { uri: ARGDOC_URI, languageId: 'matlab', version: 1, text: ARGDOC_TEXT }
+    })
+    const argDocHover = async (uri, line, character) => {
+        const response = await request('textDocument/hover', { textDocument: { uri }, position: { line, character } })
+        return response.result != null && response.result.contents ? response.result.contents.value : ''
+    }
+    const fencedLinesOf = markdown => {
+        let open = false
+        return markdown.split('\n').filter(line => {
+            if (line.startsWith('```')) {
+                open = !open
+                return false
+            }
+            return open
+        })
+    }
+    const declaredCard = await argDocHover(ARGDOC_URI, 0, 20)
+    check('hover lists argument descriptions',
+        declaredCard.includes('the input signal') && declaredCard.includes('the scale factor, applied to every sample'),
+        declaredCard.split('\n').slice(-6).join(' | '))
+    check('argument descriptions are prose, not fenced',
+        declaredCard !== '' && fencedLinesOf(declaredCard).every(line => !line.includes('%') && !line.includes('the input signal')),
+        JSON.stringify(fencedLinesOf(declaredCard)))
+    const argumentInBody = await argDocHover(ARGDOC_URI, 9, 13)
+    check('hover on an argument in the body shows its description',
+        argumentInBody.includes('variable') && argumentInBody.includes('the scale factor, applied to every sample'),
+        argumentInBody.split('\n').join(' | '))
+    // Neither file exists on disk: offline, the open file in the caller's folder answers
+    const ARGDOC_CALLER_URI = 'file:///tmp/argDocsSmoke/argDocsSmokeCaller.m'
+    notify('textDocument/didOpen', {
+        textDocument: { uri: ARGDOC_CALLER_URI, languageId: 'matlab', version: 1, text: 'y = argDocsSmokeDemo(1, 2);' }
+    })
+    const callCard = await argDocHover(ARGDOC_CALLER_URI, 0, 8)
+    check('hover on a call into another open file lists its descriptions',
+        callCard.includes('interpolation method'), callCard.split('\n').slice(0, 3).join(' | '))
+
     // Diagnostics come from the buffer being edited, with or without MATLAB. The
     // file is absent on disk, so a linter that reads the saved file finds nothing.
     const LINT_URI = 'file:///tmp/lintSmokeAbsentDir/lintSmoke.m'
@@ -481,6 +533,88 @@ async function main () {
                 folderOf(before) + ' -> ' + folderOf(after))
         } finally {
             fs.rmSync(frameDir, { recursive: true, force: true })
+        }
+
+        // --- argument descriptions for calls MATLAB resolves: which() for hover, and the
+        // --- signatureSource of the completion engine for signature help and completion
+        const argDocsDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'argDocsSmoke-'))
+        try {
+            const onPath = marker => [
+                'function y = argDocsSmokeOnPath(x, factor, opts)',
+                '    %ARGDOCSSMOKEONPATH Scale a signal.',
+                '    arguments',
+                `        x (:,1) double           % the input signal ${marker}`,
+                `        % the scale factor, applied to every sample ${marker}`,
+                '        factor (1,1) double = 2',
+                `        opts.Method (1,1) string = "lin"   % interpolation method ${marker}`,
+                '    end',
+                '    y = x * factor;',
+                'end'
+            ].join('\n')
+            fs.writeFileSync(path.join(argDocsDir, 'argDocsSmokeOnPath.m'), onPath('(on disk)'))
+            fs.writeFileSync(path.join(argDocsDir, 'normalize.m'), [
+                'function y = normalize(x)',
+                '    %NORMALIZE Shadows the MathWorks function for the smoke test.',
+                '    arguments',
+                '        x double % the data to shadow with',
+                '    end',
+                '    y = x;',
+                'end'
+            ].join('\n'))
+            await fevalOverWire('addpath', 0, [argDocsDir])
+
+            // An open file of the same name elsewhere, which which() must win over
+            notify('textDocument/didOpen', {
+                textDocument: { uri: 'file:///tmp/argDocsSmokeDecoy/argDocsSmokeOnPath.m', languageId: 'matlab', version: 1, text: onPath('(decoy buffer)') }
+            })
+            const ONPATH_CALLER_URI = 'file:///tmp/argDocsSmoke/onPathCaller.m'
+            const ONPATH_CALLER = [
+                'y = argDocsSmokeOnPath(1, ',
+                'z = argDocsSmokeOnPath(1, 2, M',
+                'w = argDocsSmokeOnPath(3);',
+                'v = normalize(4);'
+            ]
+            notify('textDocument/didOpen', {
+                textDocument: { uri: ONPATH_CALLER_URI, languageId: 'matlab', version: 1, text: ONPATH_CALLER.join('\n') }
+            })
+            await sleep(500)
+
+            const onPathCard = await argDocHover(ONPATH_CALLER_URI, 2, 8)
+            check('hover follows which() to the file on the path',
+                onPathCard.includes('interpolation method (on disk)') && !onPathCard.includes('(decoy buffer)'),
+                onPathCard.split('\n').slice(-4).join(' | '))
+
+            const argSig = (await request('textDocument/signatureHelp', {
+                textDocument: { uri: ONPATH_CALLER_URI },
+                position: { line: 0, character: ONPATH_CALLER[0].length }
+            })).result
+            const suggested = argSig != null ? argSig.signatures[argSig.activeSignature] : undefined
+            const factorParameter = suggested !== undefined
+                ? suggested.parameters.find(p => Array.isArray(p.label) && suggested.label.slice(p.label[0], p.label[1]) === 'factor')
+                : undefined
+            const factorDoc = factorParameter !== undefined ? factorParameter.documentation : undefined
+            check('signature help documents a parameter from its comment',
+                factorDoc != null && factorDoc.kind === 'markdown' &&
+                factorDoc.value.includes('the scale factor') && factorDoc.value.includes('(on disk)'),
+                JSON.stringify(factorDoc) + ' in ' + (suggested ? suggested.label : '(no signature)'))
+
+            const argCompletion = (await request('textDocument/completion', {
+                textDocument: { uri: ONPATH_CALLER_URI },
+                position: { line: 1, character: ONPATH_CALLER[1].length }
+            })).result
+            const completionItems = argCompletion != null ? (argCompletion.items || []) : []
+            const methodItem = completionItems.find(item => item.label === 'Method' || item.label === '"Method"')
+            check('name-value completion carries the field description',
+                methodItem !== undefined && methodItem.documentation != null &&
+                methodItem.documentation.value.includes('interpolation method (on disk)'),
+                methodItem !== undefined ? JSON.stringify(methodItem) : completionItems.length + ' items, no Method')
+
+            const shadowCard = await argDocHover(ONPATH_CALLER_URI, 3, 6)
+            check('hover reads a user file that shadows a MathWorks name',
+                shadowCard.includes('the data to shadow with'), shadowCard.split('\n').slice(0, 4).join(' | '))
+        } finally {
+            await fevalOverWire('rmpath', 0, [argDocsDir])
+            fs.rmSync(argDocsDir, { recursive: true, force: true })
         }
     }
 

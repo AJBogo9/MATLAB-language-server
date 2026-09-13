@@ -1,6 +1,6 @@
 // Copyright 2022 - 2025 The MathWorks, Inc.
 
-import { CompletionItem, CompletionItemKind, CompletionList, CompletionParams, ParameterInformation, Position, SignatureHelp, SignatureHelpParams, SignatureInformation, TextDocuments, InsertTextFormat } from 'vscode-languageserver'
+import { CompletionItem, CompletionItemKind, CompletionList, CompletionParams, ParameterInformation, Position, SignatureHelp, SignatureHelpParams, SignatureInformation, TextDocuments, InsertTextFormat, MarkupKind } from 'vscode-languageserver'
 import { TextDocument } from 'vscode-languageserver-textdocument'
 import MatlabLifecycleManager from '../../lifecycle/MatlabLifecycleManager'
 import ConfigurationManager, { Argument } from '../../lifecycle/ConfigurationManager'
@@ -8,6 +8,10 @@ import MVM from '../../mvm/impl/MVM'
 import Logger from '../../logging/Logger'
 import parse from '../../mvm/MdaParser'
 import * as FileNameUtils from '../../utils/FileNameUtils'
+import ArgumentDocSource from '../argumentDocs/ArgumentDocSource'
+import { describeNameValueChoice, describeParameter } from '../argumentDocs/SignatureArgumentDocs'
+import { ArgumentDeclaration } from '../hover/ArgumentsBlockParser'
+import { escapeMarkdown } from '../hover/DocCommentMarkdown'
 
 interface MCompletionData {
     widgetData?: MWidgetData
@@ -44,6 +48,9 @@ interface MCompletionChoice {
 
 interface MSignatureData {
     functionName: string
+    // The file MATLAB read the signature from: the .m path of a user function, or a
+    // functionSignatures.json for a MathWorks one
+    signatureSource?: string
     inputArguments?: MArgumentData | MArgumentData[] // If there is only one argument, it is not given as an array
     outputArguments?: MArgumentData | MArgumentData[] // If there is only one argument, it is not given as an array
     // 'primary' | 'secondary' | 'suggested'. Exactly one signature per response
@@ -56,6 +63,9 @@ interface MSignatureData {
 
 interface MArgumentData {
     name: string
+    // required, positional, optional, name or value. Every name-value struct arrives as one
+    // argument of kind name called options.
+    kind?: string
     widgetType: string
     widgetData?: MWidgetData
     status?: string
@@ -105,7 +115,7 @@ const MatlabCompletionToKind: { [index: string]: CompletionItemKind } = {
  * Currently, this handles auto-completion as well as function signature help.
  */
 class CompletionSupportProvider {
-    constructor (private readonly matlabLifecycleManager: MatlabLifecycleManager, private readonly mvm: MVM) {}
+    constructor (private readonly matlabLifecycleManager: MatlabLifecycleManager, private readonly mvm: MVM, private readonly argumentDocs = new ArgumentDocSource()) {}
 
     /**
      * Handles a request for auto-completion choices.
@@ -123,7 +133,7 @@ class CompletionSupportProvider {
 
         const completionData = await this.retrieveCompletionDataForDocument(doc, params.position)
 
-        return this.parseCompletionItems(completionData)
+        return this.parseCompletionItems(completionData, await this.findArgumentDeclarations(completionData, documentManager))
     }
 
     /**
@@ -152,7 +162,26 @@ class CompletionSupportProvider {
 
         const completionData = await this.retrieveCompletionDataForDocument(doc, params.position)
 
-        return this.parseSignatureHelp(completionData)
+        return this.parseSignatureHelp(completionData, await this.findArgumentDeclarations(completionData, documentManager))
+    }
+
+    /**
+     * Reads the arguments block behind each signature. MATLAB gives the arguments of a user
+     * function no purpose, so their comments are the only description.
+     *
+     * @param completionData The raw completion data
+     * @param documentManager The text document manager
+     * @returns The declarations for each signature
+     */
+    private async findArgumentDeclarations (
+        completionData: MCompletionData, documentManager: TextDocuments<TextDocument>
+    ): Promise<Map<MSignatureData, ArgumentDeclaration[]>> {
+        const declarations = new Map<MSignatureData, ArgumentDeclaration[]>()
+        const signatures = completionData.signatures ?? []
+        for (const signature of Array.isArray(signatures) ? signatures : [signatures]) {
+            declarations.set(signature, await this.argumentDocs.declarationsForSignature(signature, documentManager))
+        }
+        return declarations
     }
 
     /**
@@ -214,10 +243,10 @@ class CompletionSupportProvider {
      * @param completionData The raw completion data
      * @returns A list of completion items
      */
-    private parseCompletionItems (completionData: MCompletionData): CompletionList {
+    private parseCompletionItems (completionData: MCompletionData, argumentDeclarations?: Map<MSignatureData, ArgumentDeclaration[]>): CompletionList {
         const completionItems: CompletionItem[] = []
 
-        const completionsMap = new Map<string, { kind: CompletionItemKind, doc: string, insertText: string }>()
+        const completionsMap = new Map<string, { kind: CompletionItemKind, doc: string, insertText: string, documentation?: string }>()
 
         // Gather completions from top-level object. This should find function completions.
         this.gatherCompletions(completionData, completionsMap)
@@ -236,7 +265,9 @@ class CompletionSupportProvider {
                 inputArguments = Array.isArray(inputArguments) ? inputArguments : [inputArguments]
 
                 inputArguments.forEach(inputArgument => {
-                    this.gatherCompletions(inputArgument, completionsMap)
+                    // The choices of the name-value placeholder are field names
+                    const fields = inputArgument.kind === 'name' ? argumentDeclarations?.get(signature) : undefined
+                    this.gatherCompletions(inputArgument, completionsMap, true, fields)
                 })
             })
         }
@@ -259,6 +290,9 @@ class CompletionSupportProvider {
             const completionItem = CompletionItem.create(completionName)
             completionItem.kind = completionData.kind
             completionItem.detail = completionData.doc
+            if (completionData.documentation != null) {
+                completionItem.documentation = { kind: MarkupKind.Markdown, value: completionData.documentation }
+            }
             completionItem.data = index++
             completionItem.sortText = sortText
             if (completionData.kind === CompletionItemKind.Snippet) {
@@ -277,7 +311,7 @@ class CompletionSupportProvider {
      * @param completionDataObj Raw completion or argument data
      * @param completionMap A map in which to store info about possible completions
      */
-    private gatherCompletions (completionDataObj: MCompletionData | MArgumentData | MSharedData, completionMap: Map<string, { kind: CompletionItemKind, doc: string, insertText: string }>, overwrite: boolean = true): void {
+    private gatherCompletions (completionDataObj: MCompletionData | MArgumentData | MSharedData, completionMap: Map<string, { kind: CompletionItemKind, doc: string, insertText: string, documentation?: string }>, overwrite: boolean = true, nameValueFields?: ArgumentDeclaration[]): void {
         let choices = completionDataObj.widgetData?.choices
         if (choices == null) {
             return
@@ -322,7 +356,11 @@ class CompletionSupportProvider {
             completionMap.set(completion, {
                 kind: MatlabCompletionToKind[choice.matchType] ?? CompletionItemKind.Function,
                 doc: choice.purpose ?? '',
-                insertText: choice.completion ?? ''
+                insertText: choice.completion ?? '',
+                // A field of a user function has no purpose; its comment says what it is for
+                documentation: nameValueFields != null && choice.purpose == null
+                    ? describeNameValueChoice(nameValueFields, choice.completion)
+                    : undefined
             })
         })
     }
@@ -333,7 +371,7 @@ class CompletionSupportProvider {
      * @param completionData The raw completion data
      * @returns The signature help, or null if no signature help is available
      */
-    private parseSignatureHelp (completionData: MCompletionData): SignatureHelp | null {
+    private parseSignatureHelp (completionData: MCompletionData, argumentDeclarations?: Map<MSignatureData, ArgumentDeclaration[]>): SignatureHelp | null {
         let signatureData = completionData.signatures
 
         if (signatureData == null) {
@@ -404,7 +442,19 @@ class CompletionSupportProvider {
                 const labelOffsets: [number, number] = [offsetStart, offsetStart + inputArg.name.length]
 
                 const paramDocArgs = paramDoc.length > 0 ? [paramDoc] : []
-                params.push(ParameterInformation.create(labelOffsets, ...paramDocArgs))
+                const parameter = ParameterInformation.create(labelOffsets, ...paramDocArgs)
+
+                // MATLAB gives the arguments of a user function no purpose; their comments say it
+                const description = inputArg.purpose == null
+                    ? describeParameter(argumentDeclarations?.get(sigData) ?? [], inputArg)
+                    : undefined
+                if (description != null) {
+                    parameter.documentation = {
+                        kind: MarkupKind.Markdown,
+                        value: [description, escapeMarkdown(paramDoc)].filter(part => part !== '').join('\n\n')
+                    }
+                }
+                params.push(parameter)
 
                 argNames.push(inputArg.name)
 

@@ -17,6 +17,7 @@
  */
 
 import { computeBlockCommentLines } from './CommentStringScanner'
+import { DocCommentLine, indentColumns } from './DocCommentMarkdown'
 
 export type ArgumentKind = 'input' | 'output' | 'repeating'
 
@@ -35,6 +36,11 @@ export interface ArgumentDeclaration {
     kind: ArgumentKind
     /** 0-based line in the document where the declaration starts. */
     line: number
+    /**
+     * What the argument is for, from its comments: the trailing comment on the declaration, the
+     * comment lines directly above it, or both. Undefined when it has none.
+     */
+    description?: DocCommentLine[]
 }
 
 const ARGUMENTS_BLOCK_START = /^\s*arguments\b(?:\s*\(\s*([A-Za-z,\s]*?)\s*\))?\s*(?:\s*[;,])*\s*(?:%.*)?$/
@@ -44,6 +50,22 @@ const ARGUMENTS_BLOCK_START = /^\s*arguments\b(?:\s*\(\s*([A-Za-z,\s]*?)\s*\))?\
 const BLOCK_END = /^\s*end\b\s*(?:\s*[;,])*\s*(?:%.*)?$/
 const IDENTIFIER = '[A-Za-z][A-Za-z0-9_]*'
 const DECLARATION_NAME = new RegExp(`^(${IDENTIFIER}(?:\\.${IDENTIFIER})?)`)
+const COMMENT_ONLY = /^\s*%(.*)$/
+// A blank line or a %% title above a comment sets it apart as a heading
+const GROUP_SEPARATOR = /^\s*(?:%%.*)?$/
+const NUMERIC_SIZE = /^\(\s*[\d:]+(?:\s*,\s*[\d:]+)*\s*\)$/
+const SINGLE_CLASS = /^[A-Za-z][\w.]*$/
+// Classes no phrase of prose ends in, so "% tol double" reads as commented-out code
+const TYPE_CLASSES = new Set([
+    'double', 'single', 'logical', 'function_handle',
+    'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64'
+])
+// Classes named like nouns: "% pulse duration" and "% options struct" are prose, so these read as code
+// only with a default value
+const NOUN_CLASSES = new Set([
+    'char', 'string', 'cell', 'struct', 'table', 'timetable', 'datetime', 'duration', 'calendarDuration',
+    'categorical', 'dictionary', 'sym', 'graph', 'digraph', 'polyshape', 'timeseries', 'gpuArray', 'missing'
+])
 
 /**
  * Strips a trailing line comment, respecting single-quoted char arrays and
@@ -56,6 +78,17 @@ const DECLARATION_NAME = new RegExp(`^(${IDENTIFIER}(?:\\.${IDENTIFIER})?)`)
  * @returns The line with any trailing comment removed
  */
 function stripTrailingComment (line: string): string {
+    const start = findCommentStart(line)
+    return start === -1 ? line : line.slice(0, start)
+}
+
+/**
+ * Finds where a line comment starts, with the same quote and transpose rules as stripTrailingComment.
+ *
+ * @param line The source line
+ * @returns The index of the %, or -1 when the line has no comment
+ */
+function findCommentStart (line: string): number {
     let inSingle = false
     let inDouble = false
 
@@ -99,11 +132,127 @@ function stripTrailingComment (line: string): string {
         } else if (ch === '"') {
             inDouble = true
         } else if (ch === '%') {
-            return line.slice(0, i)
+            return i
         }
     }
 
-    return line
+    return -1
+}
+
+/**
+ * Removes a line's comment and collects it as a description line.
+ *
+ * @param line The source line
+ * @param trailing Receives the comment, when it describes something
+ * @returns The line without its comment
+ */
+function splitTrailingComment (line: string, trailing: DocCommentLine[]): string {
+    const start = findCommentStart(line)
+    if (start === -1) {
+        return line
+    }
+    // A Code Analyzer pragma such as %#ok<INUSA> shares the comment syntax but describes nothing
+    const comment = line.slice(start + 1)
+    const text = comment.startsWith('#') ? '' : comment.split('%#')[0]
+    if (text.trim() !== '') {
+        // Spaces after the marker line the comment up with its neighbours and say nothing about depth
+        trailing.push({ text: text.trim(), preformatted: false })
+    }
+    return line.slice(0, start)
+}
+
+/**
+ * Makes a description line from the text after a comment marker, the way a doc comment line is made:
+ * one space after the marker is dropped and the depth counts from the marker.
+ */
+function commentLine (afterMarker: string): DocCommentLine {
+    const text = afterMarker.trimEnd()
+    return { text: text.replace(/^ /, ''), preformatted: false, indent: indentColumns(text) }
+}
+
+/**
+ * Collects the comment lines directly above a declaration.
+ *
+ * The run ends at a blank line or code, and at what is not prose: a %{ %} block comment, a %%
+ * section title, a %# pragma and a commented-out declaration.
+ *
+ * @param lines The document split into lines
+ * @param declarationLine The 0-based first line of the declaration
+ * @param commented Which lines sit inside a block comment
+ * @returns The comment lines in source order, without blank lines at either end, and the line above them
+ */
+function precedingComment (lines: string[], declarationLine: number, commented: boolean[]): { run: DocCommentLine[], above: number } {
+    const run: DocCommentLine[] = []
+    let j = declarationLine - 1
+    for (; j >= 0 && !commented[j]; j--) {
+        const match = COMMENT_ONLY.exec(lines[j])
+        if (match == null || /^[%#]/.test(match[1]) || isCommentedOutDeclaration(match[1])) {
+            break
+        }
+        run.unshift(commentLine(match[1]))
+    }
+
+    while (run.length > 0 && run[0].text.trim() === '') {
+        run.shift()
+    }
+    while (run.length > 0 && run[run.length - 1].text.trim() === '') {
+        run.pop()
+    }
+    return { run, above: j }
+}
+
+/**
+ * Whether a comment is a commented-out declaration rather than prose.
+ *
+ * A declaration name alone proves nothing, since most descriptions open with a word. It needs a
+ * size such as (1,1), validators, a dotted class, a type such as double, or a class named like a
+ * noun with a default value, and at most one class token. So "% tol double", "% y (1,1)" and
+ * "% label string = "a"" are code, while "% gain factor", "% pulse duration", "% samples (N x 1)"
+ * and "% origin (0,0) of the axes" are descriptions.
+ *
+ * @param comment The text after the comment marker
+ * @returns True when the comment reads as code
+ */
+function isCommentedOutDeclaration (comment: string): boolean {
+    // Commenting out a documented declaration keeps its own comment
+    const text = stripTrailingComment(comment).trim()
+    const nameMatch = DECLARATION_NAME.exec(text)
+    if (nameMatch == null) {
+        return false
+    }
+
+    const body = parseDeclarationBody(text.slice(nameMatch[1].length))
+    if (body.className != null && !SINGLE_CLASS.test(body.className)) {
+        return false
+    }
+    return (body.size != null && NUMERIC_SIZE.test(body.size)) || body.validators != null ||
+        (body.className != null && (body.className.includes('.') || TYPE_CLASSES.has(body.className) ||
+            (body.defaultValue != null && NOUN_CLASSES.has(body.className))))
+}
+
+/**
+ * Chooses a declaration's description from its trailing comment and the comment lines above it.
+ *
+ * Both are kept, the lines above first, because an explanation above and a unit on the line
+ * (`v0 (1,1) double  % m/s`) are both about the argument. The exception is a heading above a
+ * group: when a blank line, a %% title or the arguments line sets the lines above apart, and the
+ * next declaration follows on the very next line with a comment of its own, those lines head the
+ * group and describe neither field. Lines directly under another declaration describe the one
+ * below them.
+ *
+ * @param preceding The comment lines directly above
+ * @param trailing The comments on the declaration's own lines
+ * @param headsGroup Whether the declaration opens a group of commented declarations
+ * @returns The description lines, empty when there are none
+ */
+function chooseDescription (preceding: DocCommentLine[], trailing: DocCommentLine[], headsGroup: boolean): DocCommentLine[] {
+    if (trailing.length === 0) {
+        return preceding
+    }
+    if (preceding.length === 0 || headsGroup) {
+        return trailing
+    }
+    return [...preceding, { text: '', preformatted: false }, ...trailing]
 }
 
 /**
@@ -292,33 +441,59 @@ export function parseArgumentsBlocks (
         const kind = attributeToKind(blockMatch[1])
         i++
 
-        while (i < limit && !BLOCK_END.test(lines[i])) {
+        const block: Array<{ declaration: ArgumentDeclaration, endLine: number, trailing: DocCommentLine[] }> = []
+
+        // A %{ %} block inside an arguments block is commented-out code, and an `end` inside it
+        // does not close the block.
+        while (i < limit && (commented[i] || !BLOCK_END.test(lines[i]))) {
+            if (commented[i]) {
+                i++
+                continue
+            }
+
             const declarationStartLine = i
+            const trailing: DocCommentLine[] = []
 
             // Join line continuations so a declaration split across lines parses
             // as one.
-            let joined = stripTrailingComment(lines[i])
+            let joined = splitTrailingComment(lines[i], trailing)
             while (/\.\.\.\s*$/.test(joined.trimEnd()) && i + 1 < limit) {
                 joined = joined.trimEnd().replace(/\.\.\.$/, ' ')
                 i++
-                joined += stripTrailingComment(lines[i])
+                joined += splitTrailingComment(lines[i], trailing)
             }
 
             const trimmed = joined.trim()
             if (trimmed !== '') {
                 const nameMatch = DECLARATION_NAME.exec(trimmed)
                 if (nameMatch != null) {
-                    declarations.push({
-                        name: nameMatch[1],
-                        kind,
-                        line: declarationStartLine,
-                        ...parseDeclarationBody(trimmed.slice(nameMatch[1].length))
+                    block.push({
+                        declaration: {
+                            name: nameMatch[1],
+                            kind,
+                            line: declarationStartLine,
+                            ...parseDeclarationBody(trimmed.slice(nameMatch[1].length))
+                        },
+                        endLine: i,
+                        trailing
                     })
                 }
             }
 
             i++
         }
+
+        block.forEach(({ declaration, endLine, trailing }, index) => {
+            const next = block[index + 1]
+            const { run, above } = precedingComment(lines, declaration.line, commented)
+            const headsGroup = next !== undefined && next.declaration.line === endLine + 1 && next.trailing.length > 0 &&
+                (GROUP_SEPARATOR.test(lines[above]) || ARGUMENTS_BLOCK_START.test(lines[above]))
+            const description = chooseDescription(run, trailing, headsGroup)
+            if (description.length > 0) {
+                declaration.description = description
+            }
+            declarations.push(declaration)
+        })
 
         i++ // step past the block's `end`
     }
