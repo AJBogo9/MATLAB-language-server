@@ -2,9 +2,11 @@
 
 import * as debug from '@vscode/debugadapter'
 import { DebugProtocol } from '@vscode/debugprotocol';
-import { DebugServices, BreakpointInfo } from './DebugServices'
+import { DebugServices, BreakpointInfo, GlobalBreakpointInfo } from './DebugServices'
 import { ResolvablePromise, createResolvablePromise } from '../utils/PromiseUtils'
 import { IMVM, MVMError, MatlabMVMConnectionState } from '../mvm/impl/MVM';
+import { Capability } from '../mvm/impl/RunOptions';
+import { AppliedConditions, EXCEPTION_FILTERS, LAST_MESSAGE_FUNCTIONS, StopDescription, changedFilterBreakpoints, describeStop, exceptionBreakpointId, forgetClearedCondition, identifierFromLast, parseExceptionArguments, planConditionCommands } from './exceptions/ExceptionFilters';
 import fs from 'node:fs';
 
 enum BreakpointChangeType {
@@ -14,6 +16,11 @@ enum BreakpointChangeType {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type MatlabData = any;
+
+// Fevals that run the user's code, or MATLAB code that calls it, go without the Debugging capability. They still
+// run in the selected frame, but no line breakpoint or stop condition can halt MATLAB inside them and leave the
+// request unanswered.
+const WITHOUT_DEBUGGING = ['Debugging' as Capability];
 
 const mdaLength = function (obj: MatlabData): number {
     if (obj instanceof Array) {
@@ -85,6 +92,11 @@ export default class MatlabDebugAdaptor {
 
     private _hasShownReplWarning: number = 0;
 
+    private _appliedConditions: AppliedConditions = new Map();
+    private _exceptionRequests: Promise<void> = Promise.resolve();
+    private _lastStop?: StopDescription;
+    private readonly _reportedFilters = new Map<string, DebugProtocol.Breakpoint>();
+
     constructor (mvm: IMVM, debugServices: DebugServices) {
         this._mvm = mvm;
         this._debugServices = debugServices;
@@ -96,6 +108,10 @@ export default class MatlabDebugAdaptor {
             if (state === MatlabMVMConnectionState.DISCONNECTED) {
                 this._handleDisconnect();
                 this._matlabBreakpoints = [];
+                // A new MATLAB starts without conditions or a stop, and requests waiting on the old one never settle
+                this._appliedConditions = new Map();
+                this._exceptionRequests = Promise.resolve();
+                this._lastStop = undefined;
             }
         });
 
@@ -143,7 +159,7 @@ export default class MatlabDebugAdaptor {
             } else if (request.command === 'setFunctionBreakpoints') {
                 this.sendResponse(response);
             } else if (request.command === 'setExceptionBreakpoints') {
-                this.sendResponse(response);
+                void this.setExceptionBreakpointsRequest(response as DebugProtocol.SetExceptionBreakpointsResponse, request.arguments);
             } else if (request.command === 'configurationDone') {
                 this.sendResponse(response);
             } else if (request.command === 'stepBack') {
@@ -167,7 +183,7 @@ export default class MatlabDebugAdaptor {
             } else if (request.command === 'completions') {
                 this.sendResponse(response);
             } else if (request.command === 'exceptionInfo') {
-                this.sendResponse(response);
+                void this.exceptionInfoRequest(response as DebugProtocol.ExceptionInfoResponse);
             } else if (request.command === 'loadedSources') {
                 this.sendResponse(response);
             } else if (request.command === 'dataBreakpointInfo') {
@@ -255,6 +271,11 @@ export default class MatlabDebugAdaptor {
             });
         });
 
+        // The adaptor's own dbclear calls report removals too, but their request replaces the applied state when it ends
+        this._debugServices.on(DebugServices.Events.GlobalBreakpointRemoved, (info: GlobalBreakpointInfo) => {
+            forgetClearedCondition(this._appliedConditions, info.type, info.identifiers);
+        });
+
         this._debugServices.on(DebugServices.Events.DBEnter, async () => {
             const oldValue = this._isCurrentlyDebugging;
             this._isCurrentlyDebugging = true;
@@ -275,18 +296,21 @@ export default class MatlabDebugAdaptor {
                 return;
             }
 
+            this._lastStop = undefined;
             this.sendEvent(new debug.ExitedEvent(0));
             this.sendEvent(new debug.TerminatedEvent(false));
         });
 
         this._debugServices.on(DebugServices.Events.DBCont, async () => {
             this._isCurrentlyStopped = false;
+            this._lastStop = undefined;
 
             this.sendEvent(new debug.ContinuedEvent(0, true));
         });
 
-        this._debugServices.on(DebugServices.Events.DBStop, async (filename: string, lineNumber: number, stack: MatlabData[]) => {
+        this._debugServices.on(DebugServices.Events.DBStop, async (filename: string, lineNumber: number, stack: MatlabData[], source?: unknown) => {
             this._isCurrentlyStopped = true;
+            this._lastStop = describeStop(source);
 
             const oldValue = this._isCurrentlyDebugging;
             this._isCurrentlyDebugging = true;
@@ -298,10 +322,10 @@ export default class MatlabDebugAdaptor {
 
             void this._requestStackUpdate();
 
-            this.sendEvent(new debug.StoppedEvent('breakpoint', 0));
+            this.sendEvent(this._createStoppedEvent(this._lastStop));
         });
 
-        this._debugServices.on(DebugServices.Events.DBStop, async (filename: string, lineNumber: number, stack: MatlabData[]) => {
+        this._debugServices.on(DebugServices.Events.DBStop, async (filename: string, lineNumber: number, stack: MatlabData[], source?: unknown) => {
             this._isCurrentlyStopped = true;
 
             const oldValue = this._isCurrentlyDebugging;
@@ -312,7 +336,7 @@ export default class MatlabDebugAdaptor {
 
             this._currentMATLABFrame = stack.length;
 
-            this.sendEvent(new debug.StoppedEvent('breakpoint', 0));
+            this.sendEvent(this._createStoppedEvent(describeStop(source)));
         });
 
         this._debugServices.on(DebugServices.Events.DBWorkspaceChanged, () => {
@@ -324,6 +348,14 @@ export default class MatlabDebugAdaptor {
 
     protected _handleDebuggingStateChange (): void {
         // Intentionally unimplemented
+    }
+
+    private _createStoppedEvent (stop: StopDescription = { reason: 'breakpoint' }): DebugProtocol.StoppedEvent {
+        const event: DebugProtocol.StoppedEvent = new debug.StoppedEvent(stop.reason, 0, stop.text);
+        if (stop.description !== undefined) {
+            event.body.description = stop.description;
+        }
+        return event;
     }
 
     private _registerBreakpointChangeListener (listener: (type: BreakpointChangeType, bp: BreakpointInfo) => void): { remove: () => void } {
@@ -346,6 +378,7 @@ export default class MatlabDebugAdaptor {
             supportsEvaluateForHovers: true,
             supportsExceptionOptions: true,
             supportsExceptionInfoRequest: true,
+            exceptionBreakpointFilters: EXCEPTION_FILTERS,
             supportTerminateDebuggee: true,
             supportsTerminateRequest: true,
             supportsCancelRequest: true,
@@ -376,15 +409,86 @@ export default class MatlabDebugAdaptor {
             supportsBreakpointLocationsRequest: false,
             supportsClipboardContext: false,
             supportsInstructionBreakpoints: false,
-            supportsExceptionFilterOptions: false
+            supportsExceptionFilterOptions: true
         } as DebugProtocol.Capabilities;
 
         this.sendResponse(response);
         this.sendEvent(new debug.InitializedEvent());
 
         if (this._isCurrentlyStopped) {
-            this.sendEvent(new debug.StoppedEvent('breakpoint', 0));
+            this.sendEvent(this._createStoppedEvent(this._lastStop));
         }
+    }
+
+    setExceptionBreakpointsRequest (response: DebugProtocol.SetExceptionBreakpointsResponse, args: DebugProtocol.SetExceptionBreakpointsArguments): Promise<void> {
+        const apply = async (): Promise<void> => {
+            const { entries, desired } = parseExceptionArguments(args);
+
+            const failures = new Map<string, string>();
+            for (const command of planConditionCommands(this._appliedConditions, desired)) {
+                try {
+                    const result = await this._mvm.feval(command.fn, 0, command.args);
+                    if (isError(result)) {
+                        failures.set(command.condition, result.error.msg);
+                    }
+                } catch (e) {
+                    failures.set(command.condition, 'MATLAB is not connected. The setting applies when it connects.');
+                }
+            }
+
+            // A failed condition is recorded as unknown, so the next request clears and retries it
+            const applied: AppliedConditions = new Map(desired);
+            failures.forEach((message, condition) => applied.set(condition, null));
+            this._appliedConditions = applied;
+
+            const breakpoints = entries.map((entry): DebugProtocol.Breakpoint => {
+                if (!entry.known) {
+                    return { verified: false, message: `Unknown exception filter: ${entry.filterId}` };
+                }
+                const id = exceptionBreakpointId(entry.filterId);
+                const failure = failures.get(entry.filterId);
+                return failure === undefined ? { id, verified: true } : { id, verified: false, message: failure };
+            });
+            response.body = { breakpoints };
+            this.sendResponse(response);
+
+            // VS Code reads verification only from answers to its own requests. When an answer changes what a filter
+            // showed, as the filters the client sends again once MATLAB connects can, update that row by its id
+            changedFilterBreakpoints(this._reportedFilters, entries, breakpoints)
+                .forEach(breakpoint => this.sendEvent(new debug.BreakpointEvent('changed', breakpoint)));
+        };
+
+        // One request at a time, so a quick second toggle plans against what the first applied
+        this._exceptionRequests = this._exceptionRequests.then(apply).catch((e) => {
+            console.error('Error applying exception filters', e);
+        });
+        return this._exceptionRequests;
+    }
+
+    async exceptionInfoRequest (response: DebugProtocol.ExceptionInfoResponse): Promise<void> {
+        const stop = this._lastStop;
+        if (stop?.condition === undefined) {
+            // VS Code reads the body without checking it, and may ask after the stop has moved on
+            response.body = { exceptionId: 'exception', breakMode: 'always' };
+            this.sendResponse(response);
+            return;
+        }
+
+        let identifier: string | undefined;
+        const lastMessageFunction = LAST_MESSAGE_FUNCTIONS[stop.condition];
+        if (lastMessageFunction !== undefined) {
+            try {
+                const last = await this._mvm.feval(lastMessageFunction, 2, []);
+                identifier = identifierFromLast(stop.condition, stop.text, last?.result);
+            } catch (e) {}
+        }
+
+        response.body = {
+            exceptionId: identifier ?? stop.condition,
+            description: stop.text,
+            breakMode: stop.condition === 'error' ? 'unhandled' : 'always'
+        };
+        this.sendResponse(response);
     }
 
     async disconnectRequest (response: DebugProtocol.DisconnectResponse, args: DebugProtocol.DisconnectArguments, request?: DebugProtocol.Request): Promise<void> {
@@ -655,7 +759,7 @@ export default class MatlabDebugAdaptor {
             return;
         }
 
-        const maybeVariableResult = await this._mvm.feval('matlab.internal.datatoolsservices.getWorkspaceDisplay', 1, ['caller']);
+        const maybeVariableResult = await this._mvm.feval('matlab.internal.datatoolsservices.getWorkspaceDisplay', 1, ['caller'], false, WITHOUT_DEBUGGING);
 
         if (stackChanger != null) {
             try {
@@ -720,15 +824,15 @@ export default class MatlabDebugAdaptor {
         let maybeResult;
         const oldHotlinks = await this._mvm.feval('feature', 1, ['HotLinks']);
         if (args.context === 'repl') {
-            maybeResult = await this._mvm.feval('evalc', 1, ['try, feature(\'HotLinks\', 0); ' + args.expression + ', catch exceptionObj; try; showReport(exceptionObj), end; clear exceptionObj; end']);
+            maybeResult = await this._mvm.feval('evalc', 1, ['try, feature(\'HotLinks\', 0); ' + args.expression + ', catch exceptionObj; try; showReport(exceptionObj), end; clear exceptionObj; end'], false, WITHOUT_DEBUGGING);
             if (this._hasShownReplWarning < 3) {
                 this.sendEvent(new debug.OutputEvent('For best results, evaluate expressions in the MATLAB Terminal.', 'console'));
                 this._hasShownReplWarning++;
             }
         } else if (args.context === 'watch') {
-            maybeResult = await this._mvm.feval('evalc', 1, ['try, disp(' + args.expression + "), catch, disp('Error evaluating expression'); end"]);
+            maybeResult = await this._mvm.feval('evalc', 1, ['try, disp(' + args.expression + "), catch, disp('Error evaluating expression'); end"], false, WITHOUT_DEBUGGING);
         } else {
-            maybeResult = await this._mvm.feval('evalc', 1, ["try, datatipinfo('" + args.expression + "'), catch, disp('Error evaluating expression'); end"]);
+            maybeResult = await this._mvm.feval('evalc', 1, ["try, datatipinfo('" + args.expression + "'), catch, disp('Error evaluating expression'); end"], false, WITHOUT_DEBUGGING);
         }
 
         await this._mvm.feval('feature', 0, ['HotLinks', (oldHotlinks?.result?.[0] ?? true)]);

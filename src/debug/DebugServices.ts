@@ -127,7 +127,7 @@ export class DebugServices extends EventEmitter {
         } else {
             const filepath = data.Filespec;
             const lineNumber = (data.IsAtEndOfFunction as boolean) ? -data.LineNumber : data.LineNumber;
-            this.emit(DebugServices.Events.DBStop, filepath, lineNumber, data.Stack ?? []);
+            this.emit(DebugServices.Events.DBStop, filepath, lineNumber, data.Stack ?? [], data.Source);
         }
     }
 
