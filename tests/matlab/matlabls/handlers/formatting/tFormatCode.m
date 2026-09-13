@@ -71,6 +71,29 @@ classdef tFormatCode < matlab.unittest.TestCase
 
             testCase.verifyEqual(actual, expected);
         end
+
+        % Test that every function body is indented, including top-level ones, even
+        % under MATLAB's default preference, which leaves top-level bodies flat.
+        function testIndentsEveryFunctionBody (testCase)
+            s = settings;
+            functionIndenting = s.matlab.editor.language.matlab.FunctionIndentingFormat;
+            if functionIndenting.hasTemporaryValue
+                originalValue = functionIndenting.TemporaryValue;
+                testCase.addTeardown(@setTemporaryValue, functionIndenting, originalValue);
+            else
+                testCase.addTeardown(@clearTemporaryValue, functionIndenting);
+            end
+            setTemporaryValue(functionIndenting, 'MixedFunctionIndent');
+
+            options.insertSpaces = true;
+            options.tabSize = 4;
+
+            code = sprintf('function out = outer(x)\nif x\nout = 1;\nelse\nout = 2;\nend\nend\n\nfunction helper\ndisp(1)\nend');
+            expected = sprintf('function out = outer(x)\n    if x\n        out = 1;\n    else\n        out = 2;\n    end\nend\n\nfunction helper\n    disp(1)\nend');
+            actual = matlabls.handlers.formatting.formatCode(code, 0, 10, options);
+
+            testCase.verifyEqual(actual, expected);
+        end
     end
 
     % Tests for partial-document formatting functionality
@@ -171,4 +194,8 @@ classdef tFormatCode < matlab.unittest.TestCase
             testCase.verifyEqual(actual, expected);
         end
     end
+end
+
+function setTemporaryValue (setting, value)
+    setting.TemporaryValue = value;
 end

@@ -11,6 +11,8 @@ function formattedCode = formatCode (code, startLine, endLine, options)
     cleanupObj1 = setTemporaryValue(s.matlab.editor.tab.InsertSpaces, options.insertSpaces); %#ok<NASGU> 
     cleanupObj2 = setTemporaryValue(s.matlab.editor.tab.TabSize, options.tabSize); %#ok<NASGU>
     cleanupObj3 = setTemporaryValue(s.matlab.editor.tab.IndentSize, options.tabSize); %#ok<NASGU>
+    % Indent every function body, top-level ones included, whatever the user's preference says
+    cleanupObj4 = setTemporaryValue(s.matlab.editor.language.matlab.FunctionIndentingFormat, 'AllFunctionIndent'); %#ok<NASGU>
 
     % Formatting logic expects 1-based line numbers
     formattedCode = doFormatLines(code, startLine + 1, endLine + 1, options);
