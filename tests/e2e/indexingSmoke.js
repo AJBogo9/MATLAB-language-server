@@ -1,0 +1,357 @@
+// Copyright 2026 Andreas Bogossian
+/**
+ * End-to-end check of workspace indexing against a live MATLAB. Spawns the real
+ * language server over stdio with workspace folders on a scratch tree that holds
+ * symbolic link loops, a duplicated folder, a broken link, an unreadable file and
+ * generated folders, then checks what workspace/symbol returns, the progress the
+ * server reports, and what happens when folders are added and removed. Last, a
+ * folder is added while every background pool worker is busy for longer than the
+ * crawl's silence warning time, and its crawl must still finish.
+ *
+ * Before the Node walk, MATLAB's dir('**') listed each file under the looping link
+ * up to 40 times over, and on the folder with two loops it did not return at all.
+ *
+ * Usage: node indexingSmoke.js [--matlabRoot=/path/to/MATLAB]
+ */
+'use strict'
+
+const { spawn, execFileSync } = require('child_process')
+const fs = require('fs')
+const os = require('os')
+const path = require('path')
+const { pathToFileURL } = require('url')
+
+const REPO = path.resolve(__dirname, '..', '..', '..')
+const SERVER = path.join(REPO, 'server', 'out', 'index.js')
+const rootArg = process.argv.find(a => a.startsWith('--matlabRoot='))
+const MATLAB_INSTALL_PATH = rootArg ? rootArg.slice('--matlabRoot='.length) : '/usr/local/MATLAB/R2026a'
+const HARD_TIMEOUT_MS = 6 * 60 * 1000
+const PROGRESS_TITLE = 'Indexing MATLAB files'
+// CRAWL_SILENCE_WARNING_MS in src/indexing/Indexer.ts, and how long the pool stays busy past it
+const CRAWL_SILENCE_WARNING_MS = 60000
+const POOL_BUSY_S = 80
+
+// VS Code's defaults for the two settings
+const FILES_EXCLUDE_DEFAULTS = { '**/.git': true, '**/.svn': true, '**/.hg': true, '**/.DS_Store': true, '**/Thumbs.db': true }
+const SEARCH_EXCLUDE_DEFAULTS = { '**/node_modules': true, '**/bower_components': true, '**/*.code-search': true }
+
+const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'indexingSmoke-')))
+const t0 = Date.now()
+const seconds = () => ((Date.now() - t0) / 1000).toFixed(1) + ' s'
+
+function writeFunction (relativePath, name) {
+    const fullPath = path.join(scratch, relativePath)
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true })
+    fs.writeFileSync(fullPath, `function r = ${name}(x)\nr = x;\nend\n`)
+    return fullPath
+}
+
+const REAL_A = ['a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8', 'a9', 'a10', 's1', 's2', 's3', 's4']
+const EXCLUDED_A = ['vendorFn', 'slprjFn', 'coderFn', 'gitFn', 'genFn']
+
+function buildTree () {
+    // Folder A: one loop, a duplicate link, a broken link, an unreadable file, generated folders
+    for (let i = 1; i <= 10; i++) writeFunction(`A/src/a${i}.m`, `a${i}`)
+    for (let i = 1; i <= 4; i++) writeFunction(`A/src/sub/s${i}.m`, `s${i}`)
+    fs.symlinkSync('..', path.join(scratch, 'A/src/sub/loopup'))
+    fs.symlinkSync('src', path.join(scratch, 'A/dupsrc'))
+    fs.symlinkSync('/nonexistent/target.m', path.join(scratch, 'A/aaa_broken.m'))
+    const unreadable = writeFunction('A/src/zzUnreadable.m', 'zzUnreadable')
+    fs.chmodSync(unreadable, 0o000)
+    writeFunction('A/node_modules/pkg/v.m', 'vendorFn')
+    writeFunction('A/slprj/_sfprj/g.m', 'slprjFn')
+    writeFunction('A/codegen/mex/foo/c.m', 'coderFn')
+    writeFunction('A/.git/hooks/h.m', 'gitFn')
+    writeFunction('A/gen/genFn.m', 'genFn')
+    writeFunction('A/build/buildFn.m', 'buildFn')
+
+    // Folder C: two loops, which kept MATLAB's dir busy for over 90 s
+    writeFunction('C/cfn.m', 'cfn')
+    writeFunction('C/a/ca.m', 'ca')
+    writeFunction('C/b/cb.m', 'cb')
+    fs.symlinkSync('..', path.join(scratch, 'C/a/l1'))
+    fs.symlinkSync('..', path.join(scratch, 'C/b/l2'))
+
+    // Folder D: removed later while one of its files is open
+    writeFunction('D/dfn.m', 'dfn')
+    writeFunction('D/dopen.m', 'dopen')
+
+    // Folder B: added later
+    writeFunction('B/bfn.m', 'bfn')
+    writeFunction('B/sub/bsub.m', 'bsub')
+
+    // Folder E: added while every background pool worker is busy
+    writeFunction('E/efn.m', 'efn')
+    writeFunction('E/sub/esub.m', 'esub')
+}
+
+const folderOf = name => ({ uri: pathToFileURL(path.join(scratch, name)).href, name })
+const A = folderOf('A')
+const B = folderOf('B')
+const C = folderOf('C')
+const E = folderOf('E')
+// A folder URI that ends in a slash, as a drive root's always does: its files must still be stored and dropped
+const D = { uri: `${folderOf('D').uri}/`, name: 'D' }
+let workspaceFolders = [A, C, D]
+
+let child
+let buffer = Buffer.alloc(0)
+const pending = new Map()
+const progress = []
+const configurationItems = []
+const fevalResults = new Map()
+let nextId = 1
+
+function send (message) {
+    const json = JSON.stringify(message)
+    child.stdin.write(`Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`)
+}
+
+function request (method, params) {
+    const id = nextId++
+    const promise = new Promise(resolve => pending.set(id, resolve))
+    send({ jsonrpc: '2.0', id, method, params })
+    return promise
+}
+
+const notify = (method, params) => send({ jsonrpc: '2.0', method, params })
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+function answerServerRequest (message) {
+    if (message.method === 'workspace/configuration') {
+        return message.params.items.map(item => {
+            configurationItems.push(item)
+            if (item.section === 'MATLAB') {
+                return { installPath: MATLAB_INSTALL_PATH, matlabConnectionTiming: 'onStart', indexWorkspace: true, telemetry: false, maxFileSizeForAnalysis: 0, signIn: false, defaultEditor: false, prewarmGraphics: false }
+            }
+            if (item.section === 'files.exclude') {
+                return item.scopeUri === A.uri ? { ...FILES_EXCLUDE_DEFAULTS, '**/gen': true } : FILES_EXCLUDE_DEFAULTS
+            }
+            if (item.section === 'search.exclude') {
+                return SEARCH_EXCLUDE_DEFAULTS
+            }
+            return null
+        })
+    }
+    if (message.method === 'workspace/workspaceFolders') {
+        return workspaceFolders
+    }
+    return null
+}
+
+function startServer () {
+    child = spawn('node', [SERVER, '--stdio', `--matlabInstallPath=${MATLAB_INSTALL_PATH}`, '--matlabConnectionTiming=onStart', '--indexWorkspace'], { stdio: ['pipe', 'pipe', 'pipe'] })
+    child.stderr.on('data', () => {})
+    child.stdout.on('data', chunk => {
+        buffer = Buffer.concat([buffer, chunk])
+        for (;;) {
+            const headerEnd = buffer.indexOf('\r\n\r\n')
+            if (headerEnd === -1) return
+            const lengthMatch = /Content-Length: (\d+)/i.exec(buffer.slice(0, headerEnd).toString('ascii'))
+            if (lengthMatch === null) return
+            const length = parseInt(lengthMatch[1], 10)
+            if (buffer.length < headerEnd + 4 + length) return
+            const message = JSON.parse(buffer.slice(headerEnd + 4, headerEnd + 4 + length).toString('utf8'))
+            buffer = buffer.slice(headerEnd + 4 + length)
+
+            if (message.id !== undefined && message.method === undefined && pending.has(message.id)) {
+                pending.get(message.id)(message)
+                pending.delete(message.id)
+            } else if (message.id === undefined && message.method === 'fevalResponse') {
+                fevalResults.set(message.params.requestId, message.params.result)
+            } else if (message.id === undefined && message.method === '$/progress') {
+                progress.push({ at: Date.now() - t0, token: message.params.token, value: message.params.value })
+            } else if (message.id !== undefined && message.method !== undefined) {
+                send({ jsonrpc: '2.0', id: message.id, result: answerServerRequest(message) })
+            }
+        }
+    })
+}
+
+/** Every process below the server, found while the server is still alive. */
+function descendantsOf (pid) {
+    const rows = execFileSync('ps', ['-eo', 'pid=,ppid=,comm=']).toString().trim().split('\n')
+        .map(row => row.trim().split(/\s+/)).map(([p, pp, comm]) => ({ pid: Number(p), ppid: Number(pp), comm }))
+    const found = []
+    const queue = [pid]
+    while (queue.length > 0) {
+        const parent = queue.shift()
+        for (const row of rows.filter(r => r.ppid === parent)) {
+            found.push(row)
+            queue.push(row.pid)
+        }
+    }
+    return found
+}
+
+const results = []
+function check (name, condition, detail) {
+    results.push({ name, ok: Boolean(condition) })
+    console.log(`${condition ? 'PASS' : 'FAIL'}  ${name}${detail ? '  :: ' + detail : ''}`)
+}
+
+/** Runs a MATLAB function in the server's MATLAB session, the way the client does. */
+async function fevalOverWire (functionName, nargout, args) {
+    const requestId = `indexingSmoke-feval-${nextId++}`
+    notify('fevalRequest', { requestId, functionName, nargout, args, isUserEval: false })
+    await waitFor(() => fevalResults.has(requestId), 20 * 1000)
+    return fevalResults.get(requestId)
+}
+
+async function symbolUris (name) {
+    const response = await request('workspace/symbol', { query: name })
+    return [...new Set((response.result || []).filter(s => s.name === name).map(s => s.location.uri))]
+}
+
+const tokens = () => [...new Set(progress.map(p => p.token))]
+const eventsOf = token => progress.filter(p => p.token === token).map(p => p.value)
+
+async function waitFor (condition, timeoutMs) {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+        if (await condition()) return true
+        await sleep(250)
+    }
+    return false
+}
+
+function checkProgress (label, token, expectedTotal) {
+    const events = eventsOf(token)
+    const begin = events[0]
+    check(`${label}: progress begins with the title, 0 % and a file count`,
+        begin !== undefined && begin.kind === 'begin' && begin.title === PROGRESS_TITLE && begin.percentage === 0 && begin.message === `0/${expectedTotal} files`,
+        JSON.stringify(begin))
+    const reports = events.filter(e => e.kind === 'report')
+    const percentages = reports.map(r => r.percentage)
+    check(`${label}: reported percentages rise to 100`,
+        percentages.length > 0 && percentages.every((p, i) => i === 0 || p > percentages[i - 1]) && percentages[percentages.length - 1] === 100,
+        JSON.stringify(percentages))
+    const last = reports[reports.length - 1]
+    check(`${label}: the last report counts every file`, last !== undefined && last.message === `${expectedTotal}/${expectedTotal} files`, JSON.stringify(last))
+    check(`${label}: progress ends once, after the last report`,
+        events.filter(e => e.kind === 'end').length === 1 && events[events.length - 1].kind === 'end', events.map(e => e.kind).join(','))
+}
+
+async function main () {
+    buildTree()
+    startServer()
+
+    await request('initialize', {
+        processId: process.pid,
+        rootUri: A.uri,
+        capabilities: {
+            workspace: { configuration: true, workspaceFolders: true, didChangeConfiguration: { dynamicRegistration: true } },
+            window: { workDoneProgress: true }
+        },
+        workspaceFolders
+    })
+    notify('initialized', {})
+    notify('textDocument/didOpen', {
+        textDocument: { uri: pathToFileURL(path.join(scratch, 'D/dopen.m')).href, languageId: 'matlab', version: 1, text: 'function r = dopen(x)\nr = x;\nend\n' }
+    })
+
+    // --- the first crawl, over A, C and D
+    const firstEnded = await waitFor(() => tokens().length >= 1 && eventsOf(tokens()[0]).some(e => e.kind === 'end'), 4 * 60 * 1000)
+    check('the workspace crawl ends', firstEnded, firstEnded ? `begin at ${(progress[0].at / 1000).toFixed(1)} s, end at ${(eventsOf(tokens()[0]).length && progress.filter(p => p.token === tokens()[0]).pop().at / 1000).toFixed(1)} s` : `no end within 4 min (${progress.length} progress events)`)
+    if (!firstEnded) return
+
+    // A: 14 real functions, zzUnreadable and build/buildFn; C: 3; D: 2
+    checkProgress('first crawl', tokens()[0], 21)
+    check('exclusion settings were read for each workspace folder',
+        [A, C, D].every(folder => ['files.exclude', 'search.exclude'].every(section => configurationItems.some(i => i.scopeUri === folder.uri && i.section === section))),
+        JSON.stringify(configurationItems.filter(i => i.section !== 'MATLAB')))
+
+    const perName = {}
+    for (const name of [...REAL_A, ...EXCLUDED_A, 'buildFn', 'zzUnreadable', 'cfn', 'ca', 'cb', 'dfn', 'dopen']) {
+        perName[name] = await symbolUris(name)
+    }
+    const counts = Object.fromEntries(Object.entries(perName).map(([name, uris]) => [name, uris.length]))
+    console.log('symbol URIs per name: ' + JSON.stringify(counts))
+
+    check('each function under the looping and duplicated links is listed once', REAL_A.every(name => counts[name] === 1), JSON.stringify(REAL_A.map(n => counts[n])))
+    const allUris = Object.values(perName).flat()
+    check('no symbol comes from a path through a link', !allUris.some(uri => /\/(loopup|dupsrc|l1|l2)\//.test(uri)), allUris.filter(uri => /\/(loopup|dupsrc|l1|l2)\//.test(uri)).join(', ') || 'none')
+    check('generated, vendored and files.exclude folders are not indexed', EXCLUDED_A.every(name => counts[name] === 0), JSON.stringify(EXCLUDED_A.map(n => counts[n])))
+    check('a user build folder is indexed', counts.buildFn === 1, String(counts.buildFn))
+    check('the unreadable file is skipped', counts.zzUnreadable === 0, String(counts.zzUnreadable))
+    check('the folder with two loops is indexed', counts.cfn === 1 && counts.ca === 1 && counts.cb === 1, JSON.stringify([counts.cfn, counts.ca, counts.cb]))
+    check('the other folders are indexed', counts.dfn === 1 && counts.dopen === 1, JSON.stringify([counts.dfn, counts.dopen]))
+
+    // --- adding B crawls B alone, with its own progress
+    workspaceFolders = [A, C, D, B]
+    notify('workspace/didChangeWorkspaceFolders', { event: { added: [B], removed: [] } })
+    const secondEnded = await waitFor(() => tokens().length >= 2 && eventsOf(tokens()[1]).some(e => e.kind === 'end'), 60 * 1000)
+    check('adding a folder crawls it with its own progress', secondEnded, `${tokens().length} progress tokens`)
+    if (secondEnded) {
+        checkProgress('added folder', tokens()[1], 2)
+    }
+    const bIndexed = await waitFor(async () => (await symbolUris('bfn')).length === 1 && (await symbolUris('bsub')).length === 1, 10 * 1000)
+    check('the added folder is indexed', bIndexed)
+
+    // --- removing D, which is not the first folder, drops it except the open file
+    workspaceFolders = [A, C, B]
+    notify('workspace/didChangeWorkspaceFolders', { event: { added: [], removed: [D] } })
+    const dropped = await waitFor(async () => (await symbolUris('dfn')).length === 0, 5 * 1000)
+    check('a removed folder leaves the index', dropped)
+    check('an open file of the removed folder stays indexed', (await symbolUris('dopen')).length === 1)
+    check('the other folders stay indexed', (await symbolUris('a1')).length === 1 && (await symbolUris('bfn')).length === 1)
+
+    // --- adding E while every background pool worker sleeps for longer than the silence
+    // --- warning time: the crawl waits for a worker, then ends at 100 and indexes E
+    const filled = await fevalOverWire('evalin', 0, ['base', `indexingSmokePool = backgroundPool; for k = 1:indexingSmokePool.NumWorkers, indexingSmokeBusy(k) = parfeval(indexingSmokePool, @() pause(${POOL_BUSY_S}), 0); end`])
+    const pool = await fevalOverWire('evalin', 1, ['base', '[numel(indexingSmokePool.FevalQueue.RunningFutures) + numel(indexingSmokePool.FevalQueue.QueuedFutures), indexingSmokePool.NumWorkers]'])
+    const addedAt = Date.now() - t0
+    workspaceFolders = [A, C, B, E]
+    notify('workspace/didChangeWorkspaceFolders', { event: { added: [E], removed: [] } })
+    const busyEnded = await waitFor(() => tokens().length >= 3 && eventsOf(tokens()[2]).some(e => e.kind === 'end'), (POOL_BUSY_S + 60) * 1000)
+    check('a folder added while the background pool is busy is crawled', busyEnded, `filling the pool: ${JSON.stringify(filled)}; futures queued or running, and workers: ${JSON.stringify(pool)}`)
+    if (busyEnded) {
+        const endedAt = progress.filter(p => p.token === tokens()[2]).pop().at
+        check('that crawl waited for a worker for longer than the silence warning time', endedAt - addedAt > CRAWL_SILENCE_WARNING_MS,
+            `ended ${((endedAt - addedAt) / 1000).toFixed(1)} s after the folder was added`)
+        checkProgress('folder added while the pool is busy', tokens()[2], 2)
+    }
+    const eIndexed = await waitFor(async () => (await symbolUris('efn')).length === 1 && (await symbolUris('esub')).length === 1, 10 * 1000)
+    check('the folder added while the pool was busy is indexed', eIndexed)
+}
+
+async function finish (code) {
+    let leftovers = []
+    if (child !== undefined && child.exitCode === null) {
+        const descendants = descendantsOf(child.pid)
+        child.kill('SIGTERM')
+        await sleep(8000)
+        const alive = new Set(execFileSync('ps', ['-eo', 'pid=']).toString().trim().split('\n').map(p => Number(p.trim())))
+        leftovers = descendants.filter(d => alive.has(d.pid))
+        for (const d of leftovers) {
+            try { process.kill(d.pid, 'SIGKILL') } catch {}
+        }
+    }
+    console.log(`processes left behind by the server and killed: ${leftovers.map(d => `${d.pid} ${d.comm}`).join(', ') || 'none'}`)
+    try {
+        fs.chmodSync(path.join(scratch, 'A/src/zzUnreadable.m'), 0o644)
+    } catch {}
+    fs.rmSync(scratch, { recursive: true, force: true })
+
+    const failed = results.filter(r => !r.ok)
+    console.log('')
+    console.log(`INDEXING SMOKE SUMMARY: ${results.length - failed.length}/${results.length} passed (${seconds()})`)
+    if (failed.length > 0) {
+        console.log('FAILED: ' + failed.map(f => f.name).join('; '))
+    }
+    process.exit(code !== 0 ? code : (failed.length === 0 ? 0 : 1))
+}
+
+const hardTimeout = setTimeout(() => {
+    console.error(`SMOKE ERROR: no result within ${HARD_TIMEOUT_MS / 60000} min`)
+    void finish(2)
+}, HARD_TIMEOUT_MS)
+
+main().then(() => {
+    clearTimeout(hardTimeout)
+    return finish(0)
+}, err => {
+    clearTimeout(hardTimeout)
+    console.error('SMOKE ERROR:', err)
+    return finish(2)
+})

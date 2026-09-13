@@ -11,11 +11,42 @@ import Logger from '../logging/Logger'
 import parse from '../mvm/MdaParser'
 import * as FileNameUtils from '../utils/FileNameUtils'
 import { MatlabConnection } from '../lifecycle/MatlabCommunicationManager'
+import { findMatlabFiles } from './workspace/WorkspaceFileWalker'
 
-interface WorkspaceFileIndexedResponse {
+interface IndexedFileResponse {
     isDone: boolean
     filePath: string
-    codeData: CodeInfo
+    codeData?: CodeInfo
+    error?: string
+}
+
+// Published once a background pool worker has started the crawl, before its first file
+interface CrawlStartedResponse {
+    isStarted: true
+}
+
+// Published when the crawl's future failed or was cancelled, before or during the crawl
+interface CrawlFailedResponse {
+    isFailed: true
+    error: string
+}
+
+type CrawlResponse = IndexedFileResponse | CrawlStartedResponse | CrawlFailedResponse
+
+// How long a started workspace crawl may go without a file arriving before a warning names
+// the file MATLAB is on. The crawl keeps waiting, since a large generated file can parse
+// for minutes.
+export const CRAWL_SILENCE_WARNING_MS = 60000
+
+export type CrawlResult = 'done' | 'aborted' | 'unavailable'
+
+export interface CrawlOptions {
+    // Called once MATLAB is known to be there, just before the files are sent
+    onStart?: () => Promise<void>
+    // Called for every file MATLAB reports on, whether or not it could be parsed
+    onFileDone?: (uri: string) => void
+    // Whether a parsed file may replace what the index holds for it
+    shouldStore?: (uri: string) => boolean
 }
 
 interface DocumentParseResponse {
@@ -44,8 +75,11 @@ interface PendingParse {
 }
 
 export default class Indexer {
-    private readonly INDEX_FOLDERS_RESPONSE_CHANNEL = '/matlabls/indexFolders/response'
+    private readonly INDEX_FILES_RESPONSE_CHANNEL = '/matlabls/indexFiles/response'
     private readonly PARSE_DOCUMENT_RESPONSE_CHANNEL = '/matlabls/parseDocument/response'
+
+    // Gives up each crawl still waiting for files
+    private readonly abortCrawls = new Set<() => void>()
 
     // Parses can finish out of order, so each one carries the order in which its text
     // was read, and an older result never replaces a newer one.
@@ -65,6 +99,9 @@ export default class Indexer {
         this.matlabLifecycleManager.eventEmitter.on('disconnected', () => {
             for (const requestId of [...this.pendingParses.keys()]) {
                 this.settlePendingParse(requestId, null)
+            }
+            for (const abortCrawl of [...this.abortCrawls]) {
+                abortCrawl()
             }
         })
     }
@@ -113,56 +150,126 @@ export default class Indexer {
      * @param folders A list of folder URIs to be indexed
      */
     async indexFolders (folders: string[]): Promise<void> {
-        const matlabConnection = await this.matlabLifecycleManager.getMatlabConnection()
-
-        if (matlabConnection == null || !this.mvm.isReady()) {
-            return
+        const filePaths: string[] = []
+        for (const folder of folders) {
+            filePaths.push(...await findMatlabFiles(URI.parse(folder).fsPath, () => false))
         }
 
-        const channelId = matlabConnection.getChannelId()
-        const responseChannel = `${this.INDEX_FOLDERS_RESPONSE_CHANNEL}/${channelId}`
+        await this.indexFiles(filePaths)
+    }
+
+    /**
+     * Has MATLAB parse the given files on its background pool, and stores the results
+     * as they arrive. All files go in a single request, so the MATLAB thread is needed
+     * only once, however long the crawl takes. The crawl waits for a free worker, and for
+     * each file to parse, for as long as that takes. It ends once every file was reported
+     * on, when the request or its future fails, or when MATLAB disconnects. A file that
+     * brings no result for CRAWL_SILENCE_WARNING_MS is named in a warning.
+     *
+     * @param filePaths The absolute paths of the files
+     * @param options Hooks for reporting progress and for declining results
+     * @returns 'done' once every file was reported on, 'aborted' if the request or its
+     * future failed or MATLAB disconnected, or 'unavailable' if MATLAB is not there to crawl
+     */
+    async indexFiles (filePaths: string[], options: CrawlOptions = {}): Promise<CrawlResult> {
+        if (filePaths.length === 0) {
+            return 'done'
+        }
+
+        const connection = await this.matlabLifecycleManager.getMatlabConnection()
+        if (connection == null || !this.mvm.isReady()) {
+            return 'unavailable'
+        }
+
+        await options.onStart?.()
 
         const analysisLimit = (await ConfigurationManager.getConfiguration()).maxFileSizeForAnalysis
+        // Each crawl gets its own channel, so concurrent crawls cannot finish each other
+        const channel = `${this.INDEX_FILES_RESPONSE_CHANNEL}/${connection.getChannelId()}`
 
-        const responseSub = matlabConnection.subscribe(responseChannel, message => {
-            const fileResults = message as WorkspaceFileIndexedResponse
+        return await new Promise<CrawlResult>(resolve => {
+            let isSettled = false
+            let silenceTimer: NodeJS.Timeout | undefined
 
-            if (fileResults.isDone) {
-                // No more files being indexed - safe to unsubscribe
-                matlabConnection.unsubscribe(responseSub)
+            const settle = (result: CrawlResult): void => {
+                if (isSettled) {
+                    return
+                }
+                isSettled = true
+                clearTimeout(silenceTimer)
+                this.abortCrawls.delete(abort)
+                connection.unsubscribe(subscription)
+                resolve(result)
+            }
+            const abort = (): void => settle('aborted')
+
+            // MATLAB publishes the files in list order, so this also indexes the file it is on
+            let filesReceived = 0
+
+            // Armed once a worker has started the crawl, so neither time spent waiting for
+            // the MATLAB thread nor time spent waiting for a free worker counts. It warns once
+            // per silent stretch and never gives the crawl up: a large generated file can
+            // parse for minutes, and giving up would lose every file after it.
+            const restartSilenceTimer = (): void => {
+                clearTimeout(silenceTimer)
+                silenceTimer = setTimeout(() => {
+                    Logger.warn(`No workspace indexing result for ${CRAWL_SILENCE_WARNING_MS} ms while MATLAB parses ${filePaths[filesReceived]}. Indexing continues.`)
+                }, CRAWL_SILENCE_WARNING_MS)
             }
 
-            if (fileResults.codeData.errorInfo === undefined) {
-                // Convert file path to URI, which is used as an index when storing the code data
-                const fileUri = URI.file(fileResults.filePath).toString()
-                this.fileInfoIndex.parseAndStoreCodeInfo(fileUri, fileResults.codeData)
-            }
-        })
+            this.abortCrawls.add(abort)
 
-        try {
-            const mdaFolders = {
+            // Published data arrives as plain JSON, so it must not go through MdaParser
+            const subscription = connection.subscribe(channel, message => {
+                const response = message as CrawlResponse
+
+                if ('isStarted' in response) {
+                    restartSilenceTimer()
+                    return
+                }
+                if ('isFailed' in response) {
+                    Logger.error(`Workspace indexing failed in MATLAB: ${response.error}`)
+                    settle('aborted')
+                    return
+                }
+
+                const uri = URI.file(response.filePath).toString()
+
+                if (response.codeData === undefined) {
+                    Logger.warn(`Unable to index ${response.filePath}: ${response.error ?? 'no data'}`)
+                } else if (response.codeData.errorInfo === undefined && (options.shouldStore?.(uri) ?? true)) {
+                    this.fileInfoIndex.parseAndStoreCodeInfo(uri, response.codeData)
+                }
+                options.onFileDone?.(uri)
+                filesReceived++
+
+                if (response.isDone) {
+                    settle('done')
+                } else {
+                    restartSilenceTimer()
+                }
+            })
+
+            const mdaFilePaths = {
                 mwtype: 'string',
-                mwsize: [1, folders.length],
-                mwdata: folders
+                mwsize: [1, filePaths.length],
+                mwdata: filePaths
             }
 
-            const response = await this.mvm.feval(
-                'matlabls.handlers.indexing.parseInfoFromFolder',
+            this.mvm.feval(
+                'matlabls.handlers.indexing.parseInfoFromFiles',
                 0,
-                [mdaFolders, analysisLimit, responseChannel]
-            )
-
-            if ('error' in response) {
-                Logger.error('Error received while indexing folders:')
-                Logger.error(response.error.msg)
-                Logger.warn('Not all files may have been indexed successfully.')
-                matlabConnection.unsubscribe(responseSub)
-            }
-        } catch (err) {
-            Logger.error('Error caught while indexing folders:')
-            Logger.error(err as string)
-            Logger.warn('Not all files may have been indexed successfully.')
-        }
+                [mdaFilePaths, analysisLimit, channel]
+            ).then(response => {
+                if ('error' in response) {
+                    Logger.error(`Error received while indexing the workspace: ${response.error.msg as string}`)
+                    settle('aborted')
+                }
+            }, err => {
+                Logger.error(`Error caught while indexing the workspace: ${String(err)}`)
+                settle('aborted')
+            })
+        })
     }
 
     /**

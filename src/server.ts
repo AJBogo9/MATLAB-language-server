@@ -65,7 +65,7 @@ export async function startServer (): Promise<void> {
     const pathResolver = new PathResolver(mvm)
     const fileInfoIndex = new FileInfoIndex()
     const indexer = new Indexer(matlabLifecycleManager, mvm, fileInfoIndex)
-    const workspaceIndexer = new WorkspaceIndexer(indexer)
+    const workspaceIndexer = new WorkspaceIndexer(indexer, fileInfoIndex, uri => documentManager.get(uri) !== undefined)
     const documentIndexer = new DocumentIndexer(indexer, fileInfoIndex)
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
