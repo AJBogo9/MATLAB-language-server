@@ -1,4 +1,4 @@
-function hoverData = getHoverData(topic)
+function hoverData = getHoverData(topic, useOldNamespace)
     % GETHOVERDATA Retrieves documentation for a topic, for display in an editor hover.
     %
     % The returned struct deliberately contains no logical values: the language
@@ -9,6 +9,10 @@ function hoverData = getHoverData(topic)
     % help() is the backbone and is documented and stable. Everything else is an
     % undocumented internal and is individually guarded, so a missing API
     % degrades the card rather than failing the request.
+    %
+    % useOldNamespace selects the introspection functions MATLAB kept in
+    % matlab.internal.language.introspective before R2024a. It defaults to the
+    % running release; tests pass it to run that branch on a newer MATLAB.
 
     % Copyright 2026 Andreas Bogossian
 
@@ -29,6 +33,10 @@ function hoverData = getHoverData(topic)
         return;
     end
     topic = char(topic);
+
+    if nargin < 2
+        useOldNamespace = isMATLABReleaseOlderThan('R2024a');
+    end
 
     % --- help text (always assign the output; a bare help(topic) prints into
     % --- the user's command window)
@@ -90,8 +98,15 @@ function hoverData = getHoverData(topic)
 
     % --- signature lines. Preferred over matlab.internal.help.HelpSections,
     % --- whose Syntax and Usages sections come back 1x0 with 8 Invalid entries.
+    % --- R2024a moved these functions to matlab.lang.internal, as in
+    % --- resolveNameToPath. R2026a's getSignatures is dated 2024, where the
+    % --- renamed functions keep older years, so the old name may not exist.
     try
-        sigs = matlab.lang.internal.introspective.getSignatures(topic);
+        if useOldNamespace
+            sigs = matlab.internal.language.introspective.getSignatures(topic);
+        else
+            sigs = matlab.lang.internal.introspective.getSignatures(topic);
+        end
         if ~isempty(sigs)
             hoverData.signatures = cellstr(sigs(:));
         end
@@ -100,7 +115,11 @@ function hoverData = getHoverData(topic)
 
     % --- existence and builtin-ness
     try
-        resolved = matlab.lang.internal.introspective.resolveName(topic);
+        if useOldNamespace
+            resolved = matlab.internal.language.introspective.resolveName(topic);
+        else
+            resolved = matlab.lang.internal.introspective.resolveName(topic);
+        end
         hoverData.isResolved = double(resolved.isResolved);
         if isprop(resolved, 'isBuiltin') || isfield(resolved, 'isBuiltin')
             hoverData.isBuiltin = double(resolved.isBuiltin);
