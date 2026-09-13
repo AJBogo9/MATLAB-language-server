@@ -25,6 +25,7 @@ import { staticFolderPath } from '../licensing/config'
 import ClientConnection from '../ClientConnection'
 import { WorkspaceFolder } from 'vscode-languageserver'
 import ClientCapabilitiesManager from './ClientCapabilitiesManager'
+import { killProcessTree } from './ProcessTree'
 
 interface MatlabStartupInfo {
     pid: number
@@ -41,11 +42,28 @@ export enum ConnectionState {
 }
 
 /**
+ * A launch of MATLAB, or an attach to it, that has not connected yet. A disconnect stops it.
+ */
+export interface ConnectionAttempt {
+    /**
+     * Whether a disconnect stopped the attempt. A stopped attempt spawns no MATLAB and
+     * reports no connection.
+     */
+    isStopped: () => boolean
+
+    /**
+     * Receives the attempt's session as soon as it exists, so that a disconnect can shut it down.
+     */
+    setSession: (session: MatlabSession) => void
+}
+
+/**
  * Launches and connects to a new MATLAB instance.
  *
+ * @param attempt The launch, which a disconnect can stop before MATLAB connects
  * @returns The MATLAB session
  */
-export async function launchNewMatlab (matlabLifecycleManager: MatlabLifecycleManager): Promise<MatlabSession> {
+export async function launchNewMatlab (matlabLifecycleManager: MatlabLifecycleManager, attempt: ConnectionAttempt): Promise<MatlabSession> {
     LifecycleNotificationHelper.didMatlabLaunchFail = false
     LifecycleNotificationHelper.notifyConnectionStatusChange(ConnectionState.CONNECTING)
 
@@ -63,25 +81,26 @@ export async function launchNewMatlab (matlabLifecycleManager: MatlabLifecycleMa
             NotificationService.sendNotification(Notification.LicensingServerUrl, url)
             NotificationService.sendNotification(Notification.LicensingData, licensing.getMinimalLicensingInfo())
 
-            return await new Promise<MatlabSession>((resolve) => {
+            return await new Promise<MatlabSession>((resolve, reject) => {
                 // Setup a onetime event listener for starting matlab session with licensing environment variables.
                 // The 'StartLicensedMatlab' event will be fired by the licensing server after licensing is successful.
                 // eslint-disable-next-line @typescript-eslint/no-misused-promises
                 matlabLifecycleManager.eventEmitter.once('StartLicensedMatlab', async () => {
                 // Gather the environment variables specific to licensing and pass it on for MATLAB launch.
                     environmentVariables = await licensing.setupEnvironmentVariables()
-                    resolve(await startMatlabSession(environmentVariables))
+                    // A launch that fails, or that a disconnect stopped while licensing, rejects
+                    startMatlabSession(environmentVariables, attempt).then(resolve, reject)
                 })
             })
         } else {
             // Found cached licensing, so just marshal environment variables and pass it on for MATLAB launch.
             NotificationService.sendNotification(Notification.LicensingData, licensing.getMinimalLicensingInfo())
             environmentVariables = await licensing.setupEnvironmentVariables()
-            return await startMatlabSession(environmentVariables)
+            return await startMatlabSession(environmentVariables, attempt)
         }
     } else {
         // Licensing workflows are not enabled, so start MATLAB as before.
-        return await startMatlabSession(environmentVariables)
+        return await startMatlabSession(environmentVariables, attempt)
     }
 }
 
@@ -89,15 +108,23 @@ export async function launchNewMatlab (matlabLifecycleManager: MatlabLifecycleMa
  * Starts a MATLAB session with the given environment variables.
  *
  * @param environmentVariables - The environment variables to be used when launching MATLAB.
+ * @param attempt - The launch, which a disconnect can stop before MATLAB connects.
  * @returns A promise that resolves to a MatlabSession object when MATLAB is successfully started and connected.
  * @throws Will reject the promise if there is an error in launching MATLAB or establishing the connection.
  */
-async function startMatlabSession (environmentVariables: NodeJS.ProcessEnv): Promise<MatlabSession> {
+async function startMatlabSession (environmentVariables: NodeJS.ProcessEnv, attempt: ConnectionAttempt): Promise<MatlabSession> {
     // eslint-disable-next-line no-async-promise-executor
     return await new Promise<MatlabSession>(async (resolve, reject) => {
+        if (attempt.isStopped()) {
+            // A disconnect stopped the launch before it had a session, such as while licensing
+            reject(new Error('The MATLAB launch was stopped before MATLAB started'))
+            return
+        }
+
         // Setup file watch for MATLAB starting
         const outFile = path.join(Logger.logDir, 'matlabls_conn.json')
         const matlabSession = new LocalMatlabSession()
+        attempt.setSession(matlabSession as MatlabSession)
 
         const watcher = chokidar.watch(outFile, {
             persistent: true,
@@ -111,6 +138,13 @@ async function startMatlabSession (environmentVariables: NodeJS.ProcessEnv): Pro
             // First change detected - close watcher
             void watcher.close()
 
+            if (attempt.isStopped()) {
+                // MATLAB wrote the file after a disconnect had shut the session down
+                void fsPromises.rm(outFile, { force: true })
+                reject(new Error('The MATLAB launch was stopped before MATLAB connected'))
+                return
+            }
+
             // Read startup info from file
             const connectionInfo = await readStartupInfo(outFile)
             const { pid, release, port, certFile, sessionKey } = connectionInfo
@@ -120,6 +154,12 @@ async function startMatlabSession (environmentVariables: NodeJS.ProcessEnv): Pro
             checkIfMatlabDeprecated(release)
 
             matlabSession.startConnection(port, certFile, pid, release).then(() => {
+                if (attempt.isStopped()) {
+                    // Connected after a disconnect had shut the session down, so it is not reported
+                    reject(new Error('The MATLAB launch was stopped before MATLAB connected'))
+                    return
+                }
+
                 LifecycleNotificationHelper.notifyConnectionStatusChange(ConnectionState.CONNECTED)
                 Logger.log(`MATLAB session ${matlabSession.sessionId} connected to ${release}`)
                 reportTelemetryAction(Actions.StartMatlab, release)
@@ -156,6 +196,13 @@ async function startMatlabSession (environmentVariables: NodeJS.ProcessEnv): Pro
             ...getProxyEnvironmentVariables() // Proxy specific environment variables.
         }
 
+        if (attempt.isStopped()) {
+            // A disconnect came while the launch was prepared
+            void watcher.close()
+            reject(new Error('The MATLAB launch was stopped before MATLAB started'))
+            return
+        }
+
         const matlabProcessInfo = MatlabCommunicationManager.launchNewMatlab(command, args, Logger.logDir, envVars)
         if (matlabProcessInfo == null) {
             // Error occurred while spawning MATLAB process
@@ -188,6 +235,11 @@ async function startMatlabSession (environmentVariables: NodeJS.ProcessEnv): Pro
                 Logger.error(`Error stack:\n${error.stack}`)
             }
 
+            if (attempt.isStopped()) {
+                // A launch that a disconnect stopped did not fail
+                return
+            }
+
             LifecycleNotificationHelper.didMatlabLaunchFail = true
             NotificationService.sendNotification(Notification.MatlabLaunchFailed)
         })
@@ -208,15 +260,22 @@ async function startMatlabSession (environmentVariables: NodeJS.ProcessEnv): Pro
  * Connects to a MATLAB instance over the given URL.
  *
  * @param url The URL at which to find MATLAB
+ * @param attempt The attach, which a disconnect can stop before MATLAB connects
  *
  * @returns The MATLAB session
  */
-export async function connectToMatlab (url: string): Promise<MatlabSession> {
+export async function connectToMatlab (url: string, attempt: ConnectionAttempt): Promise<MatlabSession> {
     LifecycleNotificationHelper.notifyConnectionStatusChange(ConnectionState.CONNECTING)
 
     const matlabSession = new RemoteMatlabSession()
+    attempt.setSession(matlabSession)
 
     const matlabConnection = await MatlabCommunicationManager.connectToExistingMatlab(url)
+    if (attempt.isStopped()) {
+        // The session was shut down before it had this connection to close. MATLAB is not ours to stop.
+        matlabConnection.close()
+        throw new Error('The attach to MATLAB was stopped before MATLAB connected')
+    }
     matlabSession.initialize(matlabConnection)
 
     await matlabSession.startConnection()
@@ -304,9 +363,17 @@ abstract class AbstractMatlabSession implements MatlabSession {
 /**
  * Represents a session with a locally installed MATLAB.
  */
-class LocalMatlabSession extends AbstractMatlabSession {
+export class LocalMatlabSession extends AbstractMatlabSession {
     private matlabProcess?: ChildProcess
     private matlabPid?: number
+    private isConnected = false
+
+    /**
+     * @param killTree Kills a process and every process below it
+     */
+    constructor (private readonly killTree: (pid: number) => void = killProcessTree) {
+        super()
+    }
 
     initialize (matlabConnection: MatlabConnection, matlabProcess: ChildProcess): void {
         this.matlabConnection = matlabConnection
@@ -332,7 +399,8 @@ class LocalMatlabSession extends AbstractMatlabSession {
             return await Promise.reject(new Error('LocalMatlabSession not initialized'))
         }
 
-        return await this.matlabConnection.initialize(port, certFile)
+        await this.matlabConnection.initialize(port, certFile)
+        this.isConnected = true
     }
 
     shutdown (shutdownMessage?: string): void {
@@ -360,11 +428,29 @@ class LocalMatlabSession extends AbstractMatlabSession {
             }
         }
         this.matlabConnection?.close()
+        if (!this.isConnected) {
+            this.killStartingMatlab()
+        }
         try {
             this.matlabProcess?.kill('SIGTERM')
         } catch {
             Logger.warn('Unable to kill MATLAB process - process already killed')
         }
+    }
+
+    /**
+     * Kills every process of a MATLAB that has not connected. While MATLAB starts, its
+     * launcher can outlive SIGTERM, and the processes it started outlive the launcher.
+     * A connected MATLAB exits on SIGTERM and leaves nothing behind, so it keeps that.
+     */
+    private killStartingMatlab (): void {
+        const launcher = this.matlabProcess
+        // The pid of a launcher that already exited may belong to another process by now
+        if (launcher?.pid == null || launcher.exitCode !== null || launcher.signalCode !== null) {
+            return
+        }
+
+        this.killTree(launcher.pid)
     }
 
     private setupListeners (): void {
@@ -389,7 +475,7 @@ class LocalMatlabSession extends AbstractMatlabSession {
 /**
  * Represents a session with a (potentially) remote MATLAB instance over a URL.
  */
-class RemoteMatlabSession extends AbstractMatlabSession {
+export class RemoteMatlabSession extends AbstractMatlabSession {
     initialize (matlabConnection: MatlabConnection): void {
         this.matlabConnection = matlabConnection
 

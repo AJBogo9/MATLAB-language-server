@@ -4,7 +4,8 @@ import { EventEmitter } from 'events'
 
 import ConfigurationManager, { Argument, ConnectionTiming } from './ConfigurationManager'
 import { MatlabConnection } from './MatlabCommunicationManager'
-import MatlabSession, { launchNewMatlab, connectToMatlab } from './MatlabSession'
+import LifecycleNotificationHelper from './LifecycleNotificationHelper'
+import MatlabSession, { ConnectionAttempt, ConnectionState, launchNewMatlab, connectToMatlab } from './MatlabSession'
 import WorkspaceTrust from './WorkspaceTrust'
 
 export default class MatlabLifecycleManager {
@@ -12,6 +13,8 @@ export default class MatlabLifecycleManager {
 
     private matlabSession: MatlabSession | null = null
     private connectionPromise: Promise<MatlabSession> | null = null
+    // The launch or attach under way, which a disconnect stops
+    private pendingConnection: PendingConnection | null = null
 
     /**
      * @param workspaceTrust Whether the workspace is trusted. A client that gives no trust
@@ -101,11 +104,19 @@ export default class MatlabLifecycleManager {
     }
 
     /**
-     * Terminate the current MATLAB session.
+     * Terminate the current MATLAB session, or stop the launch or attach under way.
      *
-     * Emits a 'disconnected' event.
+     * Emits a 'disconnected' event when a connected session ends. A launch or attach that
+     * is stopped emits none, as it never emitted 'connected'.
      */
     disconnectFromMatlab (): void {
+        if (this.pendingConnection != null) {
+            this.pendingConnection.stop()
+            this.pendingConnection = null
+            this.connectionPromise = null
+            return
+        }
+
         if (this.matlabSession == null) {
             return
         }
@@ -140,23 +151,8 @@ export default class MatlabLifecycleManager {
      * @returns The new MATLAB session
      */
     private async connectToLocalMatlab (): Promise<MatlabSession> {
-        this.connectionPromise = launchNewMatlab(this)
-
-        return await new Promise<MatlabSession>((resolve, reject) => {
-            this.connectionPromise?.then(matlabSession => {
-                this.matlabSession = matlabSession
-                this.matlabSession.eventEmitter.on('shutdown', () => {
-                    this.matlabSession = null
-                    this.eventEmitter.emit('disconnected')
-                })
-                this.eventEmitter.emit('connected')
-                resolve(matlabSession)
-            }).catch(reason => {
-                reject(reason)
-            }).finally(() => {
-                this.connectionPromise = null
-            })
-        })
+        const attempt = new PendingConnection()
+        return await this.trackConnection(attempt, this.launchMatlab(attempt))
     }
 
     /**
@@ -166,24 +162,102 @@ export default class MatlabLifecycleManager {
      */
     private async connectToRemoteMatlab (): Promise<MatlabSession> {
         const url = ConfigurationManager.getArgument(Argument.MatlabUrl)
-        this.connectionPromise = connectToMatlab(url)
-
-        return await new Promise<MatlabSession>((resolve, reject) => {
-            this.connectionPromise?.then(matlabSession => {
-                this.matlabSession = matlabSession
-                this.matlabSession.eventEmitter.on('shutdown', () => {
-                    this.matlabSession = null
-                    this.eventEmitter.emit('disconnected')
-                })
-                this.eventEmitter.emit('connected')
-                resolve(matlabSession)
-            }).catch(reason => {
-                reject(reason)
-            }).finally(() => {
-                this.connectionPromise = null
-            })
-        })
+        const attempt = new PendingConnection()
+        return await this.trackConnection(attempt, this.attachToMatlab(url, attempt))
     }
+
+    /**
+     * Launches a local MATLAB. Tests replace this method.
+     */
+    private async launchMatlab (attempt: ConnectionAttempt): Promise<MatlabSession> {
+        return await launchNewMatlab(this, attempt)
+    }
+
+    /**
+     * Attaches to the MATLAB at the given URL. Tests replace this method.
+     */
+    private async attachToMatlab (url: string, attempt: ConnectionAttempt): Promise<MatlabSession> {
+        return await connectToMatlab(url, attempt)
+    }
+
+    /**
+     * Makes a launch or attach the one under way, and installs its session once it connects.
+     *
+     * @param attempt The launch or attach
+     * @param connecting Resolves to its session once MATLAB connects
+     * @returns The session, or a rejection if the attempt failed or a disconnect stopped it
+     */
+    private trackConnection (attempt: PendingConnection, connecting: Promise<MatlabSession>): Promise<MatlabSession> {
+        const connection = this.installWhenConnected(attempt, connecting)
+        this.pendingConnection = attempt
+        // Features waiting for MATLAB wait for this, so they never get a session that was stopped
+        this.connectionPromise = connection
+        return connection
+    }
+
+    private async installWhenConnected (attempt: PendingConnection, connecting: Promise<MatlabSession>): Promise<MatlabSession> {
+        let matlabSession: MatlabSession
+        try {
+            matlabSession = await connecting
+        } catch (reason) {
+            throw attempt.isStopped() ? stoppedError() : reason
+        } finally {
+            // A disconnect may have replaced the attempt with a newer one, which must stay tracked
+            if (this.pendingConnection === attempt) {
+                this.pendingConnection = null
+                this.connectionPromise = null
+            }
+        }
+
+        if (attempt.isStopped()) {
+            // MATLAB connected after the disconnect, so the session ends instead of being installed
+            matlabSession.shutdown()
+            throw stoppedError()
+        }
+
+        this.matlabSession = matlabSession
+        this.matlabSession.eventEmitter.on('shutdown', () => {
+            this.matlabSession = null
+            this.eventEmitter.emit('disconnected')
+        })
+        this.eventEmitter.emit('connected')
+        return matlabSession
+    }
+}
+
+/**
+ * A launch or attach under way. Stopping it shuts its session down, now or as soon as the
+ * session exists.
+ */
+class PendingConnection implements ConnectionAttempt {
+    private session: MatlabSession | null = null
+    private stopped = false
+
+    isStopped (): boolean {
+        return this.stopped
+    }
+
+    setSession (session: MatlabSession): void {
+        this.session = session
+        if (this.stopped) {
+            session.shutdown()
+        }
+    }
+
+    stop (): void {
+        this.stopped = true
+        if (this.session != null) {
+            // The session reports that it disconnected
+            this.session.shutdown()
+        } else {
+            // The launch reported that it is connecting, but has no session to report the end
+            LifecycleNotificationHelper.notifyConnectionStatusChange(ConnectionState.DISCONNECTED)
+        }
+    }
+}
+
+function stoppedError (): Error {
+    return new Error('MATLAB was disconnected before it connected')
 }
 
 /**
