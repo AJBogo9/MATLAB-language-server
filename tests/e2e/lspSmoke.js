@@ -380,6 +380,44 @@ async function main () {
         await hoverAt(8, 5)
         const cachedMs = Date.now() - timedStart
         check('second hover on fft is served from cache', cachedMs < 100, cachedMs + ' ms')
+
+        // --- a large document parses on MATLAB's background pool, so a MATLAB-backed
+        // --- request made meanwhile is not held up. On the MATLAB thread this file takes
+        // --- about 1.6 s to parse and under 100 ms to lint (R2026a).
+        const BIG_URI = 'file:///tmp/bigParseSmoke.m'
+        const BIG_TEXT = require('fs').readFileSync(
+            path.join(MATLAB_INSTALL_PATH, 'toolbox', 'matlab', 'uitools', 'uitools', 'uitoolfactory.m'), 'utf8')
+        const timedCompletion = async () => {
+            const started = Date.now()
+            await request('textDocument/completion', {
+                textDocument: { uri: COMP_URI },
+                position: { line: 0, character: 5 }
+            })
+            return Date.now() - started
+        }
+        await timedCompletion()
+        notify('textDocument/didOpen', {
+            textDocument: { uri: BIG_URI, languageId: 'matlab', version: 1, text: BIG_TEXT }
+        })
+        const latencies = []
+        const probeUntil = Date.now() + 4000
+        while (Date.now() < probeUntil) {
+            latencies.push(await timedCompletion())
+        }
+        const worstMs = Math.max(...latencies)
+        check('completion is not held up while a large document parses', worstMs < 600,
+            'worst ' + worstMs + ' ms over ' + latencies.length + ' requests')
+
+        let indexed = []
+        const indexDeadline = Date.now() + 20000
+        while (Date.now() < indexDeadline) {
+            const found = await request('workspace/symbol', { query: 'localPrettyPrint' })
+            indexed = (found.result || []).filter(s => s.location && s.location.uri === BIG_URI)
+            if (indexed.length > 0) break
+            await sleep(250)
+        }
+        check('the large document is indexed', indexed.length > 0,
+            indexed.map(s => s.name).join(', ') || '(not found)')
     }
 
     console.log('')
