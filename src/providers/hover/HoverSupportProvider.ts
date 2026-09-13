@@ -12,6 +12,7 @@ import {
     classifySymbolAtPosition, RequestType, SymbolClassification, reportTelemetry
 } from '../../indexing/SymbolSearchService'
 import { getExpressionAtPosition } from '../../utils/ExpressionUtils'
+import { isSameFilePath } from '../../utils/FileNameUtils'
 import { isInCommentOrString } from './CommentStringScanner'
 import { escapeMarkdown } from './DocCommentMarkdown'
 import { getOperatorHelp, findOperatorAtPosition, isReservedKeyword } from './OperatorHelp'
@@ -211,7 +212,7 @@ class HoverSupportProvider {
 
         const described = declared ?? external?.info ?? null
         const helpIsForThisFile = hoverData?.whichPath != null && hoverData.whichPath !== '' &&
-            (external?.path ?? URI.parse(uri).fsPath) === hoverData.whichPath
+            isSameFilePath(external?.path ?? URI.parse(uri).fsPath, hoverData.whichPath)
         const markdown = this.renderSymbolCard(topic, hoverData, described, helpIsForThisFile)
 
         if (markdown === '') {

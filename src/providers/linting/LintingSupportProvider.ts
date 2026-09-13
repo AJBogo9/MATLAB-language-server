@@ -394,7 +394,9 @@ class LintingSupportProvider {
             return null
         } finally {
             if (tempDir !== undefined) {
-                await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined)
+                // On Windows an antivirus scan or the indexer can hold the copy for a moment after
+                // mlint exits, failing the removal with EBUSY or EPERM. Node retries only when asked.
+                await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }).catch(() => undefined)
             }
         }
     }

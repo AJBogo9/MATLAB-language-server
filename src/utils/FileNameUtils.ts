@@ -46,3 +46,20 @@ export function getFilePathFromUri (uri: string, shouldCoerceToMExt: boolean = f
     // For all other file types, replace the existing extension with '.m'
     return path.join(parsedPath.dir, `${parsedPath.name}.m`)
 }
+
+/**
+ * Checks whether two file system paths name the same file, compared as the platform compares them.
+ * On Windows the comparison ignores case and separators: VS Code spells the drive letter in lower
+ * case where MATLAB spells it in upper case, and NTFS ignores the case of folder names too.
+ *
+ * @param first One path
+ * @param second The other path
+ * @param platform The platform whose rules apply, by default the one the server runs on
+ * @returns True if both paths name the same file
+ */
+export function isSameFilePath (first: string, second: string, platform: NodeJS.Platform = process.platform): boolean {
+    if (platform === 'win32') {
+        return path.win32.normalize(first).toLowerCase() === path.win32.normalize(second).toLowerCase()
+    }
+    return path.posix.normalize(first) === path.posix.normalize(second)
+}

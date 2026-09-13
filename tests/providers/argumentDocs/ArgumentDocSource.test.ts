@@ -70,6 +70,23 @@ describe('ArgumentDocSource', () => {
         assert.strictEqual(files.readFile.called, false)
     })
 
+    // On Windows which() gives C:\ where VS Code gives c:\. Here the case of a folder stands in for
+    // the drive letter, which path.isAbsolute on Linux does not take for an absolute path.
+    it('should read the open buffer of a path spelled in another case, on Windows', async () => {
+        sinon.stub(process, 'platform').value('win32')
+        open = [TextDocument.create('file:///Work/docdemo.m', 'matlab', 3, DOCDEMO.replace('interpolation method', 'EDITED'))]
+
+        assert.strictEqual(await methodDescription(newSource()), 'EDITED')
+        assert.strictEqual(files.readFile.called, false)
+    })
+
+    it('should not read the open buffer of a path spelled in another case, on Linux', async () => {
+        sinon.stub(process, 'platform').value('linux')
+        open = [TextDocument.create('file:///Work/docdemo.m', 'matlab', 3, DOCDEMO.replace('interpolation method', 'EDITED'))]
+
+        assert.strictEqual(await methodDescription(newSource()), 'interpolation method')
+    })
+
     it('should read a file again only when its time or size changes', async () => {
         const source = newSource()
         await methodDescription(source)

@@ -456,6 +456,29 @@ describe('HoverSupportProvider', () => {
             assert.ok(text.includes('Shadowed by `/test.m`'), text)
         })
 
+        // On Windows which() gives C:\ where VS Code gives c:\, and NTFS ignores case in names
+        it('should keep the shadowing warning when which() spells the hovered file in another case, on Windows', async () => {
+            setup(['function plot(x)', '%PLOT My own plot.', 'disp(x)', 'end'].join('\n'))
+            classifyAs(SymbolClassification.FunctionOrUnbound, 'plot')
+            stubMatlab({ helpText: ' PLOT My own plot.', whichPath: '/TEST.m', shadowedBy: '/TEST.m' })
+            sinon.stub(process, 'platform').value('win32')
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(0, 10), documentManager))
+
+            assert.ok(text.includes('Shadowed by `/TEST.m`'), text)
+        })
+
+        it('should not show the shadowing warning of a file spelled in another case, on Linux', async () => {
+            setup(['function plot(x)', '%PLOT My own plot.', 'disp(x)', 'end'].join('\n'))
+            classifyAs(SymbolClassification.FunctionOrUnbound, 'plot')
+            stubMatlab({ helpText: ' PLOT My own plot.', whichPath: '/TEST.m', shadowedBy: '/TEST.m' })
+            sinon.stub(process, 'platform').value('linux')
+
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(0, 10), documentManager))
+
+            assert.ok(!text.includes('Shadowed by'), text)
+        })
+
         it('should use help() for a symbol declared here without a doc comment', async () => {
             setup(['function y = f(x)', 'y = x;', 'end'].join('\n'))
             classifyAs(SymbolClassification.FunctionOrUnbound, 'f')

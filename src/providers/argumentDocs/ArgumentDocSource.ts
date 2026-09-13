@@ -8,6 +8,7 @@ import { URI } from 'vscode-uri'
 import { ArgumentDeclaration } from '../hover/ArgumentsBlockParser'
 import HoverCache from '../hover/HoverCache'
 import { buildOfflineSymbolInfo, OfflineSymbolInfo } from '../hover/OfflineHoverBuilder'
+import { isSameFilePath } from '../../utils/FileNameUtils'
 
 /**
  * Reads the arguments blocks of other files, for signature help, completion and hover on a call.
@@ -143,7 +144,7 @@ class ArgumentDocSource {
             return null
         }
         try {
-            const document = documents.all().find(open => URI.parse(open.uri).fsPath === filePath)
+            const document = documents.all().find(open => isSameFilePath(URI.parse(open.uri).fsPath, filePath))
             let stamp: string
             if (document !== undefined) {
                 stamp = 'v' + String(document.version)

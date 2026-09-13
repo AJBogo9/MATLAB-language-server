@@ -197,6 +197,19 @@ describe('LintingSupportProvider', function () {
             assert.ok(!fs.existsSync(lintedDir), `${lintedDir} was left behind`)
         })
 
+        it('retries removing the temporary folder, which Windows can hold briefly after a write', async () => {
+            // Node retries EBUSY, EMFILE, ENFILE, ENOTEMPTY and EPERM only when given maxRetries
+            const rm = sinon.spy(fs.promises, 'rm')
+
+            await settleWithin(provider.lintDocument(newDoc()), 5000)
+
+            const lintedDir = path.dirname(lastLintedPath())
+            const removal = rm.getCalls().find(call => call.args[0] === lintedDir)
+            assert.ok(removal !== undefined, `expected ${lintedDir} to be removed; removed ${JSON.stringify(rm.getCalls().map(call => call.args[0]))}`)
+            const options = (removal.args[1] ?? {}) as { maxRetries?: number, retryDelay?: number }
+            assert.ok((options.maxRetries ?? 0) > 0 && (options.retryDelay ?? 0) > 0, `removed with ${JSON.stringify(options)}`)
+        })
+
         it('removes the temporary folder when mlint fails', async () => {
             mlintPathStub.resolves(fakeMlint('fail'))
 
