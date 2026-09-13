@@ -245,3 +245,31 @@ export function isInCommentOrString (lines: string[], line: number, character: n
     const context = getTokenContext(lines, line, character)
     return context === TokenContext.Comment || context === TokenContext.String
 }
+
+/**
+ * Finds block comments (`%{` to `%}`). A block comment nested inside another is part of
+ * the outer one.
+ *
+ * @param lines The document lines
+ * @returns The first and last line of each outermost block comment. An unclosed `%{` and a
+ *     stray `%}` give none.
+ */
+export function computeBlockCommentRanges (lines: string[]): Array<{ start: number, end: number }> {
+    const ranges: Array<{ start: number, end: number }> = []
+    let depth = 0
+    let start = -1
+    lines.forEach((line, index) => {
+        if (BLOCK_COMMENT_OPEN.test(line)) {
+            if (depth === 0) {
+                start = index
+            }
+            depth++
+        } else if (BLOCK_COMMENT_CLOSE.test(line) && depth > 0) {
+            depth--
+            if (depth === 0) {
+                ranges.push({ start, end: index })
+            }
+        }
+    })
+    return ranges
+}

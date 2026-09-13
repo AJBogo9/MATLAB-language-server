@@ -4,10 +4,11 @@ import { FoldingRangeParams, TextDocuments, FoldingRange } from 'vscode-language
 import { TextDocument } from 'vscode-languageserver-textdocument'
 import MatlabLifecycleManager from '../../lifecycle/MatlabLifecycleManager'
 import MVM from '../../mvm/impl/MVM'
-import Logger from '../../logging/Logger'
-import parse from '../../mvm/MdaParser'
+import { computeFoldingRanges } from './OfflineFoldingScanner'
 
 class FoldingSupportProvider {
+    // Folding no longer asks MATLAB, so it works while MATLAB starts, is down, or cannot parse
+    // the file. The constructor keeps its signature for server.ts.
     constructor (private readonly matlabLifecycleManager: MatlabLifecycleManager, private readonly mvm: MVM) {}
 
     async handleFoldingRangeRequest (params: FoldingRangeParams, documentManager: TextDocuments<TextDocument>): Promise<FoldingRange[] | null> {
@@ -16,69 +17,10 @@ class FoldingSupportProvider {
             return null
         }
 
-        const isConnected = this.mvm.isReady()
-        const matlabRelease = this.matlabLifecycleManager.getMatlabRelease()
+        const foldingRanges = computeFoldingRanges(docToFold.getText())
 
-        // check for connection and release
-        if (!isConnected || (matlabRelease == null) || (matlabRelease < 'R2024b')) {
-            return null
-        }
-
-        const code = docToFold.getText()
-
-        const frArray = await this.getFoldingRangesFromMatlab(code)
-
-        const foldingRanges = this.processFoldingRanges(frArray)
-
-        return foldingRanges;
-    }
-
-    /**
-     * Gets folding ranges from MATLAB.
-     *
-     * @param code The code in the file
-     * @param fileName The file's name
-     * @param matlabConnection The connection to MATLAB
-     * @returns An array of line numbers
-     */
-    private async getFoldingRangesFromMatlab (code: string): Promise<number[]> {
-        try {
-            const response = await this.mvm.feval(
-                'matlabls.handlers.folding.getFoldingRanges',
-                1,
-                [code]
-            )
-
-            if ('error' in response) {
-                // Handle MVMError
-                Logger.error('Error received while retrieving folding ranges:')
-                Logger.error(response.error.msg)
-                return []
-            }
-
-            return parse(response.result[0]) as number[]
-        } catch (err) {
-            Logger.error('Error caught while retrieving folding ranges:')
-            Logger.error(err as string)
-            return []
-        }
-    }
-
-    /**
-     * Processes folding range data from MATLAB.
-     *
-     * @param frArray An array of line numbers from MATLAB
-     * @returns An array of FoldingRanges
-     */
-    private processFoldingRanges (frArray: number[]): FoldingRange[] {
-        const fRangeArray: FoldingRange[] = []
-
-        for (let i = 0; i < frArray.length; i = i + 2) {
-            const fRange = FoldingRange.create(frArray[i] - 1, frArray[i + 1] - 1)
-            fRangeArray.push(fRange)
-        }
-
-        return fRangeArray
+        // null, unlike an empty list, lets VS Code fall back to folding by indentation
+        return foldingRanges.length > 0 ? foldingRanges : null
     }
 }
 

@@ -1,0 +1,482 @@
+[
+  {
+    "label": "sections skip %% in strings, block comments and matrices, and comments fold",
+    "code": "%% Setup\nlabel = '%% not a section';\nmsg = \"%% nor this\";\n%{\n%% hidden in a block comment\n%}\n% first help line\n% second help line\nfor k = 1:3\n    disp(k)\nend\n%% Compute\ny = [1 2\n%% inside a matrix\n3 4];\n",
+    "expected": [
+      [
+        0,
+        10,
+        "region"
+      ],
+      [
+        3,
+        5,
+        "comment"
+      ],
+      [
+        6,
+        7,
+        "comment"
+      ],
+      [
+        8,
+        10
+      ],
+      [
+        11,
+        14,
+        "region"
+      ]
+    ]
+  },
+  {
+    "label": "a section inside a block ends before the block end",
+    "code": "%% Top\nx = 1;\nif x\n%% inside if\ny = 2;\nend\n%% Bottom\nz = 3;",
+    "expected": [
+      [
+        0,
+        5,
+        "region"
+      ],
+      [
+        2,
+        5
+      ],
+      [
+        3,
+        4,
+        "region"
+      ],
+      [
+        6,
+        7,
+        "region"
+      ]
+    ]
+  },
+  {
+    "label": "sections inside a function end before its end",
+    "code": "function f()\n%% inside fn\nx = 1;\n%% second in fn\ny = 2;\nend",
+    "expected": [
+      [
+        0,
+        5
+      ],
+      [
+        1,
+        2,
+        "region"
+      ],
+      [
+        3,
+        4,
+        "region"
+      ]
+    ]
+  },
+  {
+    "label": "switch cases fold separately; else, elseif and catch do not fold",
+    "code": "switch x\n  case 1\n    a = 1;\n  otherwise\n    a = 2;\nend\ntry\n  b = 1;\ncatch err\n  b = 2;\nend\nif x\n  c = 1;\nelseif y\n  c = 2;\nelse\n  c = 3;\nend",
+    "expected": [
+      [
+        0,
+        5
+      ],
+      [
+        1,
+        2
+      ],
+      [
+        3,
+        4
+      ],
+      [
+        6,
+        10
+      ],
+      [
+        11,
+        17
+      ]
+    ]
+  },
+  {
+    "label": "catch ends a section opened in the try clause",
+    "code": "try\n  %% Attempt\n  x = 1;\n  y = 2;\ncatch err\n  z = 3;\nend",
+    "expected": [
+      [
+        0,
+        6
+      ],
+      [
+        1,
+        3,
+        "region"
+      ]
+    ]
+  },
+  {
+    "label": "else ends a section opened in the if clause",
+    "code": "if a\n  %% Branch one\n  x = 1;\nelse\n  %% Branch two\n  y = 2;\n  w = 3;\nend",
+    "expected": [
+      [
+        0,
+        7
+      ],
+      [
+        1,
+        2,
+        "region"
+      ],
+      [
+        4,
+        6,
+        "region"
+      ]
+    ]
+  },
+  {
+    "label": "otherwise ends a section opened in a case",
+    "code": "switch v\n  case 1\n    %% One\n    x = 1;\n    y = 1;\n  otherwise\n    z = 2;\nend",
+    "expected": [
+      [
+        0,
+        7
+      ],
+      [
+        1,
+        4
+      ],
+      [
+        2,
+        4,
+        "region"
+      ],
+      [
+        5,
+        6
+      ]
+    ]
+  },
+  {
+    "label": "functions without end close at the next function",
+    "code": "function f()\nx = 1;\n%% sec in f\ny = 2;\nfunction g()\nz = 3;",
+    "expected": [
+      [
+        0,
+        3
+      ],
+      [
+        2,
+        3,
+        "region"
+      ],
+      [
+        4,
+        5
+      ]
+    ]
+  },
+  {
+    "label": "a function without end ends at its last code line",
+    "code": "function f()\nx = 1;\n\n% ----\nfunction g()\ny = 2;\n\n",
+    "expected": [
+      [
+        0,
+        1
+      ],
+      [
+        4,
+        5
+      ]
+    ]
+  },
+  {
+    "label": "a section after the last code line of a function without end spans the next function",
+    "code": "function f()\nx = 1;\n\n%% Helper g\nfunction g()\ny = 2;\n%% Helper h\nfunction h()\nz = 3;",
+    "expected": [
+      [
+        0,
+        1
+      ],
+      [
+        3,
+        5,
+        "region"
+      ],
+      [
+        4,
+        5
+      ],
+      [
+        6,
+        8,
+        "region"
+      ],
+      [
+        7,
+        8
+      ]
+    ]
+  },
+  {
+    "label": "a method named end does not close its function",
+    "code": "classdef C\n  methods\n    function n = end(obj,k,n)\n      n = 1;\n    end\n    function m(obj)\n      x = 1;\n    end\n  end\nend",
+    "expected": [
+      [
+        0,
+        9
+      ],
+      [
+        1,
+        8
+      ],
+      [
+        2,
+        4
+      ],
+      [
+        5,
+        7
+      ]
+    ]
+  },
+  {
+    "label": "an end(...) method declaration does not close the methods block",
+    "code": "classdef C\n  methods (Hidden)\n    e = end(a,k,n)\n    disp(a)\n  end\n  methods\n    function m(obj)\n      x = 1;\n    end\n  end\nend",
+    "expected": [
+      [
+        0,
+        10
+      ],
+      [
+        1,
+        4
+      ],
+      [
+        5,
+        9
+      ],
+      [
+        6,
+        8
+      ]
+    ]
+  },
+  {
+    "label": "an arguments block after a continued function signature",
+    "code": "function out = f(a, ...\n    b)\narguments\n  a double\n  b double\nend\nout = a + b;\nend",
+    "expected": [
+      [
+        0,
+        7
+      ],
+      [
+        2,
+        5
+      ]
+    ]
+  },
+  {
+    "label": "end inside indexing does not close a block",
+    "code": "%% A\nif true\n  v = x(end);\n  w = c{end};\nend\n%% B\nq = 1;",
+    "expected": [
+      [
+        0,
+        4,
+        "region"
+      ],
+      [
+        1,
+        4
+      ],
+      [
+        5,
+        6,
+        "region"
+      ]
+    ]
+  },
+  {
+    "label": "methods(...) inside an if is a call, not a block",
+    "code": "%% A\nif x\n  methods(obj)\nend\n%% B\ny = 1;",
+    "expected": [
+      [
+        0,
+        3,
+        "region"
+      ],
+      [
+        1,
+        3
+      ],
+      [
+        4,
+        5,
+        "region"
+      ]
+    ]
+  },
+  {
+    "label": "properties(...) inside a function is a call, not a block",
+    "code": "function f(obj)\n  properties(obj)\n  y = 1;\nend",
+    "expected": [
+      [
+        0,
+        3
+      ]
+    ]
+  },
+  {
+    "label": "methods, properties and events in a script are not blocks",
+    "code": "%% A\nm = methods('double');\np = properties(obj);\nevents = 3;\n%% B\nx = 1;",
+    "expected": [
+      [
+        0,
+        3,
+        "region"
+      ],
+      [
+        4,
+        5,
+        "region"
+      ]
+    ]
+  },
+  {
+    "label": "a shell escape line is not code",
+    "code": "%% A\n!echo if\n%% B\nx = 1;",
+    "expected": [
+      [
+        0,
+        1,
+        "region"
+      ],
+      [
+        2,
+        3,
+        "region"
+      ]
+    ]
+  },
+  {
+    "label": "block comments and code break runs of comment lines",
+    "code": "% a\n% b\n%{\nc\n%}\n% d\n% e\nx = 1;",
+    "expected": [
+      [
+        0,
+        1,
+        "comment"
+      ],
+      [
+        2,
+        4,
+        "comment"
+      ],
+      [
+        5,
+        6,
+        "comment"
+      ]
+    ]
+  },
+  {
+    "label": "a section header breaks a run of comment lines",
+    "code": "% a\n% b\n%% Sec\n% c\n% d\nx = 1;",
+    "expected": [
+      [
+        0,
+        1,
+        "comment"
+      ],
+      [
+        2,
+        5,
+        "region"
+      ],
+      [
+        3,
+        4,
+        "comment"
+      ]
+    ]
+  },
+  {
+    "label": "one-line blocks do not fold",
+    "code": "%% A\nif x, y = 1; end\nfor k = 1:3, z = k; end\n%% B\nq = 1;",
+    "expected": [
+      [
+        0,
+        2,
+        "region"
+      ],
+      [
+        3,
+        4,
+        "region"
+      ]
+    ]
+  },
+  {
+    "label": "the last section ends before the empty line after a trailing newline",
+    "code": "%% A\nx = 1;\n\n\n%% B\ny = 2;\n\n",
+    "expected": [
+      [
+        0,
+        3,
+        "region"
+      ],
+      [
+        4,
+        6,
+        "region"
+      ]
+    ]
+  },
+  {
+    "label": "Windows line endings",
+    "code": "x = 1;\r\nif x\r\n  y = 2;\r\nend\r\n%% S\r\nz = 3;",
+    "expected": [
+      [
+        1,
+        3
+      ],
+      [
+        4,
+        5,
+        "region"
+      ]
+    ]
+  },
+  {
+    "label": "Windows line endings in a file whose functions have no end",
+    "code": "function f()\r\nx = 1;\r\n% trailing note\r\n\r\nfunction g()\r\ny = 2;\r\n",
+    "expected": [
+      [
+        0,
+        1
+      ],
+      [
+        4,
+        5
+      ]
+    ]
+  },
+  {
+    "label": "sections still fold while a block has no end yet",
+    "code": "%% A\nif x\n  y = 1;\n%% B\nz = 2;",
+    "expected": [
+      [
+        0,
+        4,
+        "region"
+      ],
+      [
+        3,
+        4,
+        "region"
+      ]
+    ],
+    "matlab": "MATLAB returns no ranges for this syntax error"
+  }
+]

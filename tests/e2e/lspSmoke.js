@@ -78,7 +78,8 @@ child.stdout.on('data', chunk => {
             continue
         }
 
-        if (message.id !== undefined && pending.has(message.id)) {
+        // A request from the server carries an id too, and the two id sequences overlap
+        if (message.id !== undefined && message.method === undefined && pending.has(message.id)) {
             const resolve = pending.get(message.id)
             pending.delete(message.id)
             resolve(message)
@@ -196,6 +197,17 @@ async function main () {
     notify('textDocument/didOpen', {
         textDocument: { uri: DOC_URI, languageId: 'matlab', version: 1, text: DOC_TEXT }
     })
+
+    // Folding needs no MATLAB, so ask before MATLAB has had time to start
+    const FOLD_URI = 'file:///tmp/foldingSmoke.m'
+    const foldingCase = require('../providers/folding/foldingCases.json')[0]
+    notify('textDocument/didOpen', {
+        textDocument: { uri: FOLD_URI, languageId: 'matlab', version: 1, text: foldingCase.code }
+    })
+    const expectedFolds = JSON.stringify(foldingCase.expected.map(([startLine, endLine, kind]) => ({ startLine, endLine, kind: kind ?? null })))
+    const foldsOf = response => JSON.stringify((response.result || []).map(r => ({ startLine: r.startLine, endLine: r.endLine, kind: r.kind ?? null })))
+    const earlyFolds = foldsOf(await request('textDocument/foldingRange', { textDocument: { uri: FOLD_URI } }))
+    check('folding ranges come with kinds before MATLAB is ready', earlyFolds === expectedFolds, earlyFolds)
 
     if (USE_MATLAB) {
         process.stdout.write('waiting for MATLAB to connect ')
@@ -317,6 +329,10 @@ async function main () {
             hoverSmokeSymbol !== undefined && hoverSmokeSymbol.location === undefined && selection !== undefined &&
             selection.start.line === 0 && selection.start.character === 13 && selection.end.character === 23,
             JSON.stringify(hoverSmokeSymbol))
+
+        // --- with MATLAB connected, folding still comes from the document
+        const connectedFolds = foldsOf(await request('textDocument/foldingRange', { textDocument: { uri: FOLD_URI } }))
+        check('folding ranges come with kinds once MATLAB is connected', connectedFolds === expectedFolds, connectedFolds)
 
         // --- workspace symbols (Ctrl+T) over the index the open document built
         const wsResp = await request('workspace/symbol', { query: 'hoverSmoke' })
