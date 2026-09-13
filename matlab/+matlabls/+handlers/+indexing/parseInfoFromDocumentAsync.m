@@ -19,7 +19,8 @@ function status = parseInfoFromDocumentAsync (code, filePath, analysisLimit, res
             % With one worker the parse would wait behind a whole workspace crawl
             return
         end
-        if ~isempty(pool.FevalQueue.QueuedFutures)
+        % R2021b's pool has no FevalQueue, so a parse is queued without checking for a queue
+        if isprop(pool, 'FevalQueue') && ~isempty(pool.FevalQueue.QueuedFutures)
             status = 2;
             return
         end

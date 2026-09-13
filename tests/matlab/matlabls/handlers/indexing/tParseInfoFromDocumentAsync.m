@@ -69,6 +69,21 @@ classdef tParseInfoFromDocumentAsync < matlab.unittest.TestCase
             testCase.verifyEqual(status, 0);
         end
 
+        function testQueuesWithAPoolThatHasNoFevalQueue (testCase)
+            % R2021b's background pool has no FevalQueue, so its queue cannot be read.
+            % The parse is queued anyway, rather than every parse falling back to the
+            % MATLAB thread; a parse left waiting still falls back after its timeout.
+            import matlab.unittest.fixtures.PathFixture
+            import matlab.unittest.fixtures.SuppressedWarningsFixture
+
+            testCase.applyFixture(SuppressedWarningsFixture('MATLAB:dispatcher:nameConflict'));
+            testCase.applyFixture(PathFixture(fullfile(pwd, 'testData', 'noFevalQueuePool')));
+
+            status = matlabls.handlers.indexing.parseInfoFromDocumentAsync('x = 1;', 'x.m', 0, '/matlabls/test/unused', 1);
+
+            testCase.verifyEqual(status, 1);
+        end
+
         function testDeclinesWhileThePoolIsBusy (testCase)
             pool = backgroundPool;
             futures = parallel.FevalFuture.empty;
