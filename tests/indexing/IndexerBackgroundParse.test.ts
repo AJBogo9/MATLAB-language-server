@@ -320,6 +320,72 @@ describe('Indexer background parsing', () => {
         assert.strictEqual(syncCalls().length, 0)
     })
 
+    describe('of a document MATLAB could not parse', () => {
+        const PARSE_ERROR = 'L 2 (C 6): SYNER: Parse error at \'(\': usage might be invalid MATLAB syntax.'
+        const fallbackFunctions = (): string[] | undefined =>
+            fileInfoIndex.fallbackDeclarations.get(DOC_URI)?.functions.map(declaration => declaration.name)
+
+        /** Indexes the document, with MATLAB publishing the codeData given for it. */
+        const indexWith = async (document: TextDocument, codeData: any): Promise<void> => {
+            const text = document.getText()
+            const indexing = indexer.indexDocument(document)
+            await waitUntil(() => asyncCalls().some(call => call.args[2][0] === text))
+            fake.deliver({ requestId: requestIdFor(text), codeData })
+            await settleWithin(indexing, 1000)
+        }
+
+        it('keeps the last good parse while the document does not parse', async () => {
+            await indexWith(doc('function fun\nend', 1), F_1)
+
+            await indexWith(doc('function fun\nx = (;\nend\nfunction typedIn\nend', 2), { ...F_1, errorInfo: PARSE_ERROR })
+
+            assert.deepStrictEqual(storedFunctions(), ['fun'])
+            assert.strictEqual(fallbackFunctions(), undefined)
+        })
+
+        it('stores the declarations in the text of a document that never parsed', async () => {
+            await indexWith(doc('function typedIn\nx = (;\nend'), { ...F_1, errorInfo: PARSE_ERROR })
+
+            assert.ok(!fileInfoIndex.codeInfoCache.has(DOC_URI))
+            assert.deepStrictEqual(fallbackFunctions(), ['typedIn'])
+            assert.strictEqual(syncCalls().length, 0)
+        })
+
+        it('scans the text MATLAB parsed, not the text the document has once the result arrives', async () => {
+            const document = doc('function typedIn\nx = (;\nend', 1)
+            const indexing = indexer.indexDocument(document)
+            await waitUntil(() => asyncCalls().length === 1)
+            TextDocument.update(document, [{ text: 'function typedLater\nx = (;\nend' }], 2)
+
+            fake.deliver({ requestId: asyncCalls()[0].args[2][4], codeData: { ...F_1, errorInfo: PARSE_ERROR } })
+            await settleWithin(indexing, 1000)
+
+            assert.deepStrictEqual(fallbackFunctions(), ['typedIn'])
+        })
+
+        it('stores the declarations of a document that did not parse on the MATLAB thread', async () => {
+            asyncStatus = 0
+            const text = 'function onThread\nx = (;\nend'
+            syncReplies.set(text, Promise.resolve({ ...syncCodeData('sync'), errorInfo: PARSE_ERROR }))
+
+            await settleWithin(indexer.indexDocument(doc(text)), 1000)
+
+            assert.strictEqual(syncCalls().length, 1)
+            assert.ok(!fileInfoIndex.codeInfoCache.has(DOC_URI))
+            assert.deepStrictEqual(fallbackFunctions(), ['onThread'])
+        })
+
+        it('drops the declarations once the document parses', async () => {
+            await indexWith(doc('function typedIn\nx = (;\nend', 1), { ...F_1, errorInfo: PARSE_ERROR })
+            assert.deepStrictEqual(fallbackFunctions(), ['typedIn'])
+
+            await indexWith(doc('function f1\nend\nfunction f2\nend', 2), F_2)
+
+            assert.strictEqual(fallbackFunctions(), undefined)
+            assert.deepStrictEqual(storedFunctions(), ['f1', 'f2'])
+        })
+    })
+
     it('does not count time spent waiting for the MATLAB thread against the timeout', async () => {
         const accepted = deferred<any>()
         mockMvm.feval.callsFake(async (name: string) => {

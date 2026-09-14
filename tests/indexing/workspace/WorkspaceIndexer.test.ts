@@ -506,6 +506,24 @@ describe('WorkspaceIndexer', function () {
         assert.deepStrictEqual(sorted([...fileInfoIndex.codeInfoCache.keys()]), sorted([uris.open, uris.sibling, uris.nested, uris.sameNamePrefix, uris.untitled]))
     })
 
+    it('drops the declarations of unparsable files of a removed folder, but not of an open document', async () => {
+        const uris = {
+            removed: URI.file(path.join(root, 'proj/broken.m')).toString(),
+            open: URI.file(path.join(root, 'proj/open.m')).toString(),
+            sibling: URI.file(path.join(root, 'proj2/broken.m')).toString()
+        }
+        for (const uri of Object.values(uris)) {
+            fileInfoIndex.fallbackDeclarations.set(uri, { functions: [] })
+        }
+        openDocuments.add(uris.open)
+        connection.workspace.getWorkspaceFolders.resolves([folder('proj2')])
+
+        folderChangeHandler?.({ added: [], removed: [folder('proj')] })
+        await flush()
+
+        assert.deepStrictEqual(sorted([...fileInfoIndex.fallbackDeclarations.keys()]), sorted([uris.open, uris.sibling]))
+    })
+
     it('stores and drops the files of a folder whose URI ends in a separator', async () => {
         write('proj/a.m')
         write('proj/sub/b.m')

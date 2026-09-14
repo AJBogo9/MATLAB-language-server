@@ -123,7 +123,8 @@ export default class WorkspaceIndexer {
             const remainingFolders = await ClientConnection.getConnection().workspace.getWorkspaceFolders() ?? []
             const remainingPaths = remainingFolders.map(folder => toFolderPath(folder.uri))
 
-            for (const uri of this.fileInfoIndex.codeInfoCache.keys()) {
+            // A file MATLAB could not parse has scanned declarations in place of code info
+            for (const uri of [...this.fileInfoIndex.codeInfoCache.keys(), ...this.fileInfoIndex.fallbackDeclarations.keys()]) {
                 const filePath = URI.parse(uri).fsPath
                 const isRemoved = removedPaths.some(folderPath => isInsideFolder(filePath, folderPath)) &&
                     !remainingPaths.some(folderPath => isInsideFolder(filePath, folderPath))
@@ -131,6 +132,7 @@ export default class WorkspaceIndexer {
                 // An open document keeps its entry, which parses of its buffer keep current
                 if (isRemoved && !this.isOpenDocument(uri)) {
                     this.fileInfoIndex.codeInfoCache.delete(uri)
+                    this.fileInfoIndex.fallbackDeclarations.delete(uri)
                 }
             }
         } catch (err) {

@@ -11,7 +11,7 @@ import getMockMvm from '../mocks/Mvm.mock'
 
 import ClientConnection from '../../src/ClientConnection'
 import FileInfoIndex from '../../src/indexing/FileInfoIndex'
-import Indexer, { CRAWL_SILENCE_WARNING_MS } from '../../src/indexing/Indexer'
+import Indexer, { CRAWL_SILENCE_WARNING_MS, CrawlOptions } from '../../src/indexing/Indexer'
 import ConfigurationManager from '../../src/lifecycle/ConfigurationManager'
 import MatlabLifecycleManager from '../../src/lifecycle/MatlabLifecycleManager'
 import Logger from '../../src/logging/Logger'
@@ -637,6 +637,79 @@ describe('Indexer workspace crawl', () => {
         cancelReply = async () => ({ error: { msg: 'Undefined function cancelCrawl' } })
         assert.strictEqual(await settleWithin(indexer.indexFiles(['/w/a.m']), 100), 'aborted')
         await waitUntil(() => warnings().some(message => message.includes('Undefined function cancelCrawl')))
+    })
+
+    describe('of a file MATLAB could not parse', () => {
+        const PARSE_ERROR = 'L 2 (C 6): SYNER: Parse error at \'(\': usage might be invalid MATLAB syntax.'
+        let root = ''
+        let brokenPath = ''
+
+        const fallbackFunctions = (filePath: string): string[] | undefined =>
+            fileInfoIndex.fallbackDeclarations.get(uriOf(filePath))?.functions.map(declaration => declaration.name)
+
+        /** Crawls the one file, with MATLAB reporting the message given for it. */
+        const crawlOne = async (filePath: string, message: object, options: CrawlOptions = {}): Promise<void> => {
+            const count = crawlCalls().length
+            const crawl = indexer.indexFiles([filePath], options)
+            await waitUntil(() => crawlCalls().length === count + 1)
+            fake.deliver(channelOf(crawlCalls()[count]), { filePath, isDone: true, ...message })
+            assert.strictEqual(await settleWithin(crawl, 1000), 'done')
+        }
+
+        before(() => {
+            root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'unparsable-')))
+            brokenPath = path.join(root, 'broken.m')
+            fs.writeFileSync(brokenPath, 'function broken\nx = (;\nend\n\nfunction brokenLocal\nend\n')
+        })
+
+        after(() => {
+            if (root !== '') {
+                fs.rmSync(root, { recursive: true, force: true })
+            }
+        })
+
+        it('stores the declarations in the file, in place of the entry of an older parse', async () => {
+            fileInfoIndex.parseAndStoreCodeInfo(uriOf(brokenPath), F_1)
+            const reported: string[] = []
+
+            await crawlOne(brokenPath, { codeData: { ...F_1, errorInfo: PARSE_ERROR } }, { onFileDone: uri => reported.push(uri) })
+
+            assert.deepStrictEqual(fallbackFunctions(brokenPath), ['broken', 'brokenLocal'])
+            assert.ok(!fileInfoIndex.codeInfoCache.has(uriOf(brokenPath)), 'the older parse no longer matches the file')
+            assert.deepStrictEqual(reported, [uriOf(brokenPath)])
+        })
+
+        it('neither stores the declarations nor drops the entry of a file the caller declines', async () => {
+            fileInfoIndex.parseAndStoreCodeInfo(uriOf(brokenPath), F_1)
+            const shouldStore = sinon.spy((_uri: string) => false)
+
+            await crawlOne(brokenPath, { codeData: { ...F_1, errorInfo: PARSE_ERROR } }, { shouldStore })
+
+            sinon.assert.calledWith(shouldStore, uriOf(brokenPath))
+            assert.strictEqual(fallbackFunctions(brokenPath), undefined)
+            assert.deepStrictEqual(storedFunctions(brokenPath), ['fun'])
+        })
+
+        it('drops the declarations once the file parses', async () => {
+            await crawlOne(brokenPath, { codeData: { ...F_1, errorInfo: PARSE_ERROR } })
+            assert.deepStrictEqual(fallbackFunctions(brokenPath), ['broken', 'brokenLocal'])
+
+            await crawlOne(brokenPath, { codeData: F_2 })
+
+            assert.strictEqual(fallbackFunctions(brokenPath), undefined)
+            assert.deepStrictEqual(storedFunctions(brokenPath), ['f1', 'f2'])
+        })
+
+        it('leaves the index as it is when the file cannot be read', async () => {
+            const missingPath = path.join(root, 'missing.m')
+            fileInfoIndex.parseAndStoreCodeInfo(uriOf(missingPath), F_1)
+            sinon.stub(Logger, 'log')
+
+            await crawlOne(missingPath, { codeData: { ...F_1, errorInfo: PARSE_ERROR } })
+
+            assert.strictEqual(fallbackFunctions(missingPath), undefined)
+            assert.deepStrictEqual(storedFunctions(missingPath), ['fun'])
+        })
     })
 
     describe('of a class folder', function () {

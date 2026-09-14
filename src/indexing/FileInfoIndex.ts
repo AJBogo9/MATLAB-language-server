@@ -3,6 +3,7 @@
 import { Range } from 'vscode-languageserver'
 import Logger from '../logging/Logger'
 import { URI } from 'vscode-uri'
+import { ScannedDeclarations } from '../providers/hover/OfflineHoverBuilder'
 
 // NOTE: Things like "variable definitions" and "function references" refer
 // to whether the *first component* of an identifier, not the entity
@@ -173,6 +174,7 @@ function convertSectionInfo (rawSectionInfo: RawSectionInfo): SectionInfo {
  */
 class FileInfoIndex {
     readonly codeInfoCache = new Map<string, MatlabCodeInfo>() // Maps URI to code info
+    readonly fallbackDeclarations = new Map<string, ScannedDeclarations>() // Maps URI of a file MATLAB could not parse to the declarations in its text
     private readonly classInfoMap = new Map<string, MatlabClassInfo>() // Maps URI of classdef to class info
 
     parseAndStoreCodeInfo (uri: string, rawCodeInfo: CodeInfo): MatlabCodeInfo {
@@ -193,8 +195,21 @@ class FileInfoIndex {
 
         const parsedCodeInfo = new MatlabCodeInfo(uri, rawCodeInfo, associatedClassInfo)
         this.codeInfoCache.set(uri, parsedCodeInfo)
+        this.fallbackDeclarations.delete(uri)
 
         return parsedCodeInfo
+    }
+
+    /**
+     * Stores the declarations scanned from the text of a file MATLAB could not parse, in place
+     * of any code info stored for the file.
+     *
+     * @param uri The URI of the file
+     * @param declarations The declarations in its text
+     */
+    storeFallbackDeclarations (uri: string, declarations: ScannedDeclarations): void {
+        this.codeInfoCache.delete(uri)
+        this.fallbackDeclarations.set(uri, declarations)
     }
 
     private getAssociatedClassUri (uri: string, rawCodeInfo: CodeInfo): string {

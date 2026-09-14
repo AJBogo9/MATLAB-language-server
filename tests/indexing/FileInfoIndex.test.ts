@@ -60,6 +60,32 @@ describe('FileInfoIndex', () => {
         fileInfoIndex = new FileInfoIndex()
     }
 
+    describe('#storeFallbackDeclarations', () => {
+        beforeEach(() => setup())
+
+        const declarations = { functions: [{ name: 'fun', range: Range.create(0, 9, 0, 12), isMethod: false }] }
+
+        it('stores the declarations in place of the code info of the file', () => {
+            fileInfoIndex.parseAndStoreCodeInfo('F_1.m', F_1_rawCodeData)
+
+            fileInfoIndex.storeFallbackDeclarations('F_1.m', declarations)
+
+            assert.ok(!fileInfoIndex.codeInfoCache.has('F_1.m'))
+            assert.strictEqual(fileInfoIndex.fallbackDeclarations.get('F_1.m'), declarations)
+        })
+
+        it('drops the declarations of a file once its code info is stored', () => {
+            fileInfoIndex.storeFallbackDeclarations('F_1.m', declarations)
+            fileInfoIndex.storeFallbackDeclarations('F_2.m', declarations)
+
+            fileInfoIndex.parseAndStoreCodeInfo('F_1.m', F_1_rawCodeData)
+
+            assert.ok(!fileInfoIndex.fallbackDeclarations.has('F_1.m'))
+            assert.ok(fileInfoIndex.codeInfoCache.has('F_1.m'))
+            assert.strictEqual(fileInfoIndex.fallbackDeclarations.get('F_2.m'), declarations)
+        })
+    })
+
     describe('#parseAndStoreCodeInfo', () => {
         beforeEach(() => setup())
 

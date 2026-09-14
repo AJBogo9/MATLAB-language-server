@@ -1,7 +1,8 @@
 // Copyright 2026 Andreas Bogossian
 
+import { Range } from 'vscode-languageserver'
 import { parseArgumentsBlocks, renderArgumentsTable, ArgumentDeclaration } from './ArgumentsBlockParser'
-import { computeBlockCommentLines } from './CommentStringScanner'
+import { classifyLine, computeBlockCommentLines, TokenContext } from './CommentStringScanner'
 import { DocCommentLine, firstLineIsSummary, indentColumns, renderDocComment } from './DocCommentMarkdown'
 
 /**
@@ -108,6 +109,170 @@ export function findDeclarationLine (
     return null
 }
 
+export interface ScannedDeclaration {
+    /** The name as declared. */
+    name: string
+    /** The range of the name. */
+    range: Range
+}
+
+export interface ScannedFunctionDeclaration extends ScannedDeclaration {
+    /** Whether the function is declared directly in a methods block of a classdef. */
+    isMethod: boolean
+}
+
+export interface ScannedDeclarations {
+    classdef?: ScannedDeclaration
+    /** The functions, in the order declared. */
+    functions: ScannedFunctionDeclaration[]
+}
+
+// A property get or set method, whose dotted name FUNCTION_DECLARATION does not take
+const ACCESSOR_DECLARATION = /^\s*function\s+(?:\[[^\]]*\]\s*=\s*|[A-Za-z][A-Za-z0-9_]*\s*=\s*)?((?:get|set)\.[A-Za-z][A-Za-z0-9_]*)\s*(?:\(|$|%)/
+// Keywords that always open a block closed by `end`
+const BLOCK_KEYWORDS = new Set(['classdef', 'function', 'if', 'for', 'parfor', 'while', 'switch', 'try', 'spmd'])
+// Keywords that open a block only on a line of their own, with any attributes, directly in the
+// block CONTEXTUAL_BLOCK_PARENTS names. Anywhere else each is an ordinary name, as in `methods(obj)`.
+const CONTEXTUAL_BLOCK_START = /^\s*(properties|methods|events|enumeration|arguments)\s*(?:\(.*)?$/
+const CONTEXTUAL_BLOCK_PARENTS: Record<string, string> = {
+    properties: 'classdef',
+    methods: 'classdef',
+    events: 'classdef',
+    enumeration: 'classdef',
+    arguments: 'function'
+}
+
+/**
+ * Finds the classdef and every function declared in the document: main, local and nested
+ * functions, and the methods of a classdef, each with the range of its name.
+ *
+ * MATLAB's parser returns no symbols at all for a file with a syntax error, so this is what
+ * workspace symbols can list for such a file. Like findDeclarationLine it matches declaration
+ * lines, so a syntax error elsewhere in the file hides no declaration. Telling a method from a
+ * nested or local function takes the blocks of the classdef, counted from the keywords outside
+ * comments and strings, and from each `end` outside brackets, where it is not an index. A syntax
+ * error that unbalances them can make a method read as a function, or the reverse, but loses no
+ * declaration.
+ *
+ * @param documentText The full text of the document
+ * @returns The classdef, if the document declares one, and the functions
+ */
+export function scanDeclarations (documentText: string): ScannedDeclarations {
+    const lines = documentText.split(/\r?\n/)
+    const commented = computeBlockCommentLines(lines)
+    const declarations: ScannedDeclarations = { functions: [] }
+
+    // The blocks and brackets open, innermost last. Counted from the classdef on.
+    const blocks: string[] = []
+    const brackets: string[] = []
+    // The name of the function declared last, which is no keyword even when it is end
+    let functionName: Range | undefined
+
+    for (let i = 0; i < lines.length; i++) {
+        if (commented[i]) {
+            continue
+        }
+
+        if (ANY_SCOPE_START.test(lines[i])) {
+            const declaration = joinContinuations(lines, i)
+            const functionMatch = FUNCTION_DECLARATION.exec(declaration.text) ?? ACCESSOR_DECLARATION.exec(declaration.text)
+            const classMatch = CLASSDEF_DECLARATION.exec(declaration.text)
+
+            if (functionMatch != null) {
+                // Only a parenthesis or a comment sign follows the name in the match
+                const offset = functionMatch[0].lastIndexOf(functionMatch[1])
+                const declared = declaredName(i, declaration, offset, functionMatch[1])
+                functionName = declared.range
+                declarations.functions.push({
+                    ...declared,
+                    isMethod: blocks[blocks.length - 1] === 'methods'
+                })
+            } else if (classMatch != null && declarations.classdef === undefined) {
+                const offset = classMatch[0].length - classMatch[1].length
+                declarations.classdef = declaredName(i, declaration, offset, classMatch[1])
+            }
+        }
+
+        if (declarations.classdef !== undefined) {
+            let line = lines[i]
+            if (functionName?.start.line === i) {
+                // A method named end overloads end in indexing, and closes no block
+                const { start, end } = functionName
+                line = line.slice(0, start.character) + ' '.repeat(end.character - start.character) + line.slice(end.character)
+            }
+            countBlocks(line, blocks, brackets)
+        }
+    }
+
+    return declarations
+}
+
+/**
+ * Locates a name found in a declaration joined across lines.
+ *
+ * @param startLine The 0-based first physical line of the declaration
+ * @param declaration The joined declaration: where each physical line starts in its text, and
+ * the indentation the join dropped from each
+ * @param offset Where the name starts in the joined text
+ * @param name The name
+ * @returns The name with its range
+ */
+function declaredName (
+    startLine: number, declaration: { lineStarts: number[], indents: number[] }, offset: number, name: string
+): ScannedDeclaration {
+    let segment = declaration.lineStarts.length - 1
+    while (segment > 0 && declaration.lineStarts[segment] > offset) {
+        segment--
+    }
+    const character = offset - declaration.lineStarts[segment] + declaration.indents[segment]
+    return { name, range: Range.create(startLine + segment, character, startLine + segment, character + name.length) }
+}
+
+/**
+ * Counts the blocks a line opens and closes, and the brackets it leaves open.
+ *
+ * @param line The line
+ * @param blocks The keywords of the blocks open, innermost last
+ * @param brackets The brackets open, innermost last. Parentheses close with a line that does not
+ * continue, while square brackets and braces can hold rows on the lines that follow.
+ */
+function countBlocks (line: string, blocks: string[], brackets: string[]): void {
+    const contexts = classifyLine(line)
+    const code = line.split('').map((char, index) => contexts[index] === TokenContext.Code ? char : ' ').join('')
+
+    const contextual = CONTEXTUAL_BLOCK_START.exec(code)
+    if (contextual != null && blocks[blocks.length - 1] === CONTEXTUAL_BLOCK_PARENTS[contextual[1]]) {
+        blocks.push(contextual[1])
+        return
+    }
+
+    const tokens = /[A-Za-z]\w*|[()[\]{}]/g
+    let token = tokens.exec(code)
+    while (token != null) {
+        const text = token[0]
+        if (text === '(' || text === '[' || text === '{') {
+            brackets.push(text)
+        } else if (text === ')' || text === ']' || text === '}') {
+            brackets.pop()
+        } else if (brackets.length === 0 && !/[\w.]/.test(code[token.index - 1] ?? '')) {
+            // A word right after a digit is part of a number, and one after a dot is a field
+            if (text === 'end') {
+                blocks.pop()
+            } else if (BLOCK_KEYWORDS.has(text)) {
+                blocks.push(text)
+            }
+        }
+        token = tokens.exec(code)
+    }
+
+    const commentStart = contexts.indexOf(TokenContext.Comment)
+    if (commentStart === -1 || !line.startsWith('...', commentStart)) {
+        while (brackets[brackets.length - 1] === '(') {
+            brackets.pop()
+        }
+    }
+}
+
 /**
  * Joins a logical line that continues across physical lines with `...`.
  *
@@ -115,19 +280,27 @@ export function findDeclarationLine (
  *
  * @param lines The document split into lines
  * @param start The 0-based first physical line
- * @returns The joined text and the last physical line consumed
+ * @returns The joined text, the last physical line consumed, and for each physical line where
+ * its text starts in the joined text and how much indentation the join dropped from it
  */
-export function joinContinuations (lines: string[], start: number): { text: string, endLine: number } {
+export function joinContinuations (
+    lines: string[], start: number
+): { text: string, endLine: number, lineStarts: number[], indents: number[] } {
     let text = lines[start] ?? ''
     let i = start
+    const lineStarts = [0]
+    const indents = [0]
 
     while (/\.\.\.\s*$/.test(text.trimEnd()) && i + 1 < lines.length) {
         text = text.trimEnd().replace(/\s*\.\.\.$/, ' ')
         i++
-        text += lines[i].trimStart()
+        const next = lines[i].trimStart()
+        lineStarts.push(text.length)
+        indents.push(lines[i].length - next.length)
+        text += next
     }
 
-    return { text, endLine: i }
+    return { text, endLine: i, lineStarts, indents }
 }
 
 /**

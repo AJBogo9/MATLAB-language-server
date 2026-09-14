@@ -5,6 +5,7 @@ import { URI } from 'vscode-uri'
 import MatlabLifecycleManager from '../lifecycle/MatlabLifecycleManager'
 import FileInfoIndex, { CodeInfo, MatlabClassInfo } from './FileInfoIndex'
 import * as fs from 'fs/promises'
+import { readFileSync } from 'fs'
 import ConfigurationManager from '../lifecycle/ConfigurationManager'
 import MVM from '../mvm/impl/MVM'
 import Logger from '../logging/Logger'
@@ -12,6 +13,7 @@ import parse from '../mvm/MdaParser'
 import * as FileNameUtils from '../utils/FileNameUtils'
 import { MatlabConnection } from '../lifecycle/MatlabCommunicationManager'
 import { findMatlabFiles } from './workspace/WorkspaceFileWalker'
+import { scanDeclarations } from '../providers/hover/OfflineHoverBuilder'
 
 interface IndexedFileResponse {
     isDone: boolean
@@ -122,9 +124,24 @@ export default class Indexer {
         }
 
         const requestId = ++this.lastParseRequestId
-        const codeInfo = await this.getCodeInfo(textDocument.getText(), textDocument.uri, requestId)
+        // Edits change the document while MATLAB parses it
+        const code = textDocument.getText()
+        const codeInfo = await this.getCodeInfo(code, textDocument.uri, requestId)
 
-        if (codeInfo === null || !this.claimNewestParse(textDocument.uri, requestId)) {
+        if (codeInfo === null) {
+            return
+        }
+
+        if (codeInfo.errorInfo !== undefined) {
+            // A document being edited keeps its last good parse through a syntax error, so the
+            // declarations in its text stand in only for a document that has none
+            if (!this.fileInfoIndex.codeInfoCache.has(textDocument.uri) && this.claimNewestParse(textDocument.uri, requestId)) {
+                this.fileInfoIndex.storeFallbackDeclarations(textDocument.uri, scanDeclarations(code))
+            }
+            return
+        }
+
+        if (!this.claimNewestParse(textDocument.uri, requestId)) {
             return
         }
 
@@ -269,8 +286,12 @@ export default class Indexer {
 
                 if (response.codeData === undefined) {
                     Logger.warn(`Unable to index ${response.filePath}: ${response.error ?? 'no data'}`)
-                } else if (response.codeData.errorInfo === undefined && (options.shouldStore?.(uri) ?? true)) {
-                    this.fileInfoIndex.parseAndStoreCodeInfo(uri, response.codeData)
+                } else if (options.shouldStore?.(uri) ?? true) {
+                    if (response.codeData.errorInfo === undefined) {
+                        this.fileInfoIndex.parseAndStoreCodeInfo(uri, response.codeData)
+                    } else {
+                        this.storeDeclarationsFromDisk(uri, response.filePath)
+                    }
                 }
                 options.onFileDone?.(uri)
                 filesReceived++
@@ -321,11 +342,32 @@ export default class Indexer {
         const code = fileContentBuffer.toString()
         const codeInfo = await this.getCodeInfo(code, uri, requestId)
 
-        if (codeInfo === null || !this.claimNewestParse(uri, requestId)) {
+        if (codeInfo === null || codeInfo.errorInfo !== undefined || !this.claimNewestParse(uri, requestId)) {
             return
         }
 
         this.fileInfoIndex.parseAndStoreCodeInfo(uri, codeInfo)
+    }
+
+    /**
+     * Stores the declarations in a file on disk that MATLAB could not parse, in place of the
+     * code info the index holds for it, which no longer matches the file. The crawl does not
+     * send the text, so the file is read again. It is read synchronously, so that the index
+     * changes in the order MATLAB reports the files, and holds every file once the crawl is done.
+     *
+     * @param uri The URI of the file
+     * @param filePath The path of the file
+     */
+    private storeDeclarationsFromDisk (uri: string, filePath: string): void {
+        let code: string
+        try {
+            code = readFileSync(filePath).toString()
+        } catch (err) {
+            Logger.log(`Unable to read ${filePath} for its declarations: ${String(err)}`)
+            return
+        }
+
+        this.fileInfoIndex.storeFallbackDeclarations(uri, scanDeclarations(code))
     }
 
     /**
@@ -355,7 +397,8 @@ export default class Indexer {
      * @param uri The URI associated with the code
      * @param requestId The order in which this parse read its text
      *
-     * @returns The raw data extracted from the document
+     * @returns The raw data extracted from the document, with errorInfo set if the code has
+     * a syntax error, or null if no data came back
      */
     private async getCodeInfo (code: string, uri: string, requestId: number): Promise<CodeInfo | null> {
         const connection = await this.matlabLifecycleManager.getMatlabConnection()
@@ -388,8 +431,8 @@ export default class Indexer {
      * Parses the document on MATLAB's background pool. The result is published on a
      * channel instead of returned, so the MATLAB thread is free while the parse runs.
      *
-     * @returns The parsed data, null if the document could not be parsed, or FALLBACK
-     * if it should be parsed on the MATLAB thread instead
+     * @returns The parsed data, with errorInfo set if the code has a syntax error, null if
+     * MATLAB disconnected, or FALLBACK if it should be parsed on the MATLAB thread instead
      */
     private async getCodeInfoInBackground (connection: MatlabConnection, code: string, uri: string, requestId: number): Promise<BackgroundParseResult> {
         let channel: string
@@ -486,7 +529,7 @@ export default class Indexer {
             return
         }
 
-        this.settlePendingParse(message.requestId, message.codeData.errorInfo === undefined ? message.codeData : null)
+        this.settlePendingParse(message.requestId, message.codeData)
     }
 
     private settlePendingParse (requestId: number, result: BackgroundParseResult): void {
@@ -505,7 +548,8 @@ export default class Indexer {
      * @param code The code being parsed
      * @param uri The URI associated with the code
      *
-     * @returns The raw data extracted from the document
+     * @returns The raw data extracted from the document, with errorInfo set if the code has
+     * a syntax error, or null if the parse failed
      */
     private async getCodeInfoSynchronously (code: string, uri: string): Promise<CodeInfo | null> {
         const filePath = FileNameUtils.getFilePathFromUri(uri)
@@ -524,13 +568,7 @@ export default class Indexer {
                 return null
             }
 
-            const codeInfo = parse(response.result[0]) as CodeInfo
-
-            if (codeInfo.errorInfo === undefined) {
-                return codeInfo
-            } else {
-                return null
-            }
+            return parse(response.result[0]) as CodeInfo
         } catch (err) {
             Logger.error('Error caught while parsing file:')
             Logger.error(err as string)

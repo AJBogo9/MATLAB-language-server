@@ -6,6 +6,7 @@ import FileInfoIndex, {
     MatlabFunctionScopeInfo, MatlabGlobalScopeInfo
 } from '../../indexing/FileInfoIndex'
 import { URI } from 'vscode-uri'
+import { ScannedDeclarations } from '../hover/OfflineHoverBuilder'
 
 /**
  * Provides workspace/symbol, which is Ctrl+T.
@@ -19,6 +20,10 @@ import { URI } from 'vscode-uri'
  * and every range is already in memory. The caveat is that the cache is only
  * populated after the MVM connects, so a cold window with MATLAB never started
  * returns nothing.
+ *
+ * MATLAB parses a file with a syntax error to no symbols at all, so such a file
+ * has no MatlabCodeInfo. It is listed from the declarations scanned from its
+ * text instead, which FileInfoIndex.fallbackDeclarations holds.
  */
 
 /**
@@ -54,6 +59,15 @@ class WorkspaceSymbolProvider {
             this.collectFromFile(codeInfo, query, results, limit)
         }
 
+        for (const [uri, declarations] of this.fileInfoIndex.fallbackDeclarations) {
+            if (results.length >= limit) {
+                break
+            }
+            if (!this.fileInfoIndex.codeInfoCache.has(uri)) {
+                this.collectFromDeclarations(uri, declarations, query, results, limit)
+            }
+        }
+
         return results
     }
 
@@ -61,20 +75,7 @@ class WorkspaceSymbolProvider {
         codeInfo: MatlabCodeInfo, query: string, results: SymbolInformation[], limit: number
     ): void {
         const uri = codeInfo.uri
-
-        const push = (name: string, kind: SymbolKind, range: Range, containerName?: string): void => {
-            if (results.length >= limit) {
-                return
-            }
-            if (!matchesQuery(name, query)) {
-                return
-            }
-            const symbol = SymbolInformation.create(name, kind, range, uri)
-            if (containerName != null && containerName !== '') {
-                symbol.containerName = containerName
-            }
-            results.push(symbol)
-        }
+        const push = symbolPusher(uri, query, results, limit)
 
         const classdef: MatlabClassdefInfo | undefined = codeInfo.globalScopeInfo.classScope?.classdefInfo
         const className = classdef?.declarationNameId.name ?? classNameFromClassFolder(uri)
@@ -100,6 +101,28 @@ class WorkspaceSymbolProvider {
         // workspace-wide floods Ctrl+T with "Setup", "Plot" and "Cleanup"
         // repeated across hundreds of files, and documentSymbol already covers
         // them within a file.
+    }
+
+    /**
+     * Lists a file MATLAB could not parse, with the kinds and container names
+     * collectFromFile gives a parsed one. Only the range of each name is known.
+     */
+    private collectFromDeclarations (
+        uri: string, declarations: ScannedDeclarations, query: string, results: SymbolInformation[], limit: number
+    ): void {
+        const push = symbolPusher(uri, query, results, limit)
+        const packageName = packageFromUri(uri)
+        const className = declarations.classdef?.name ?? classNameFromClassFolder(uri)
+
+        if (declarations.classdef != null) {
+            push(declarations.classdef.name, SymbolKind.Class, declarations.classdef.range, packageName)
+        }
+
+        declarations.functions.forEach((declaration, index) => {
+            // As FileInfoIndex does, take the first function of a file in a class folder for a method
+            const isMethod = declaration.isMethod || (index === 0 && declarations.classdef == null && className != null)
+            push(declaration.name, isMethod ? SymbolKind.Method : SymbolKind.Function, declaration.range, isMethod ? className : packageName)
+        })
     }
 }
 
@@ -155,6 +178,49 @@ export function classNameFromClassFolder (uri: string): string | undefined {
     const decoded = URI.parse(uri).fsPath
     const rawMatch = /@([a-zA-Z]\w*)/.exec(decoded)
     return rawMatch != null ? rawMatch[1] : undefined
+}
+
+/**
+ * Recovers the package of a file from the + folders that hold it, which is how
+ * MATLAB's parse names it: `+bank/+core/deposit.m` is in `bank.core`. A class
+ * folder holding the file is in the package that holds the class folder.
+ *
+ * @param uri The file URI
+ * @returns The package, or '' when the file is not in one
+ */
+export function packageFromUri (uri: string): string {
+    const folders = URI.parse(uri).fsPath.split(/[\\/]/).slice(0, -1)
+    if (folders.length > 0 && folders[folders.length - 1].startsWith('@')) {
+        folders.pop()
+    }
+
+    const packages: string[] = []
+    while (folders.length > 0 && folders[folders.length - 1].startsWith('+')) {
+        packages.unshift((folders.pop() as string).slice(1))
+    }
+    return packages.join('.')
+}
+
+/**
+ * Makes the function that adds a symbol of the file to the results, while they
+ * are not full and when its name matches the query.
+ */
+function symbolPusher (
+    uri: string, query: string, results: SymbolInformation[], limit: number
+): (name: string, kind: SymbolKind, range: Range, containerName?: string) => void {
+    return (name, kind, range, containerName) => {
+        if (results.length >= limit) {
+            return
+        }
+        if (!matchesQuery(name, query)) {
+            return
+        }
+        const symbol = SymbolInformation.create(name, kind, range, uri)
+        if (containerName != null && containerName !== '') {
+            symbol.containerName = containerName
+        }
+        results.push(symbol)
+    }
 }
 
 function getAllFunctionScopes (codeInfo: MatlabCodeInfo): MatlabFunctionScopeInfo[] {

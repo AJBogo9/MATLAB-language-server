@@ -3,8 +3,9 @@
  * End-to-end check of workspace indexing against a live MATLAB. Spawns the real
  * language server over stdio with workspace folders on a scratch tree that holds
  * symbolic link loops, a duplicated folder, a broken link, an unreadable file and
- * generated folders, then checks what workspace/symbol returns, the progress the
- * server reports, and what happens when folders are added and removed. Then a
+ * generated folders, then checks what workspace/symbol returns, for files and open
+ * documents with a syntax error too, the progress the server reports, and what
+ * happens when folders are added and removed. Then a
  * folder is added while every background pool worker is busy for longer than the
  * crawl's silence warning time, and its crawl must still finish. Last, a folder
  * whose only file parses for longer than the silence warning time is added, and a
@@ -51,6 +52,26 @@ function writeFunction (relativePath, name) {
     return fullPath
 }
 
+// A classdef with one method, whose body holds the line given, and a local function after it
+function writeClassdef (relativePath, name, methodName, localName, bodyLine) {
+    const fullPath = path.join(scratch, relativePath)
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true })
+    fs.writeFileSync(fullPath, [
+        `classdef ${name} < handle`,
+        '    methods',
+        `        function r = ${methodName}(obj)`,
+        `            ${bodyLine}`,
+        '            r = obj;',
+        '        end',
+        '    end',
+        'end',
+        '',
+        `function ${localName}`,
+        'end',
+        ''
+    ].join('\n'))
+}
+
 const REAL_A = ['a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8', 'a9', 'a10', 's1', 's2', 's3', 's4']
 const EXCLUDED_A = ['vendorFn', 'slprjFn', 'coderFn', 'gitFn', 'genFn']
 
@@ -76,10 +97,14 @@ function buildTree () {
     writeFunction('C/b/cb.m', 'cb')
     fs.symlinkSync('..', path.join(scratch, 'C/a/l1'))
     fs.symlinkSync('..', path.join(scratch, 'C/b/l2'))
+    // A package holding a classdef that parses and one with a syntax error
+    writeClassdef('C/+pk/PkGood.m', 'PkGood', 'pkGoodMethod', 'pkGoodLocal', 'x = 1;')
+    writeClassdef('C/+pk/PkBroken.m', 'PkBroken', 'pkBrokenMethod', 'pkBrokenLocal', 'x = (;')
 
-    // Folder D: removed later while one of its files is open
+    // Folder D: removed later while one of its files is open. One file has a syntax error.
     writeFunction('D/dfn.m', 'dfn')
     writeFunction('D/dopen.m', 'dopen')
+    fs.writeFileSync(path.join(scratch, 'D/dbroken.m'), 'function r = dbroken(x)\nr = (x;\nend\n\nfunction dbrokenLocal\nend\n')
 
     // Folder B: added later
     writeFunction('B/bfn.m', 'bfn')
@@ -222,6 +247,11 @@ async function symbolUris (name) {
     return [...new Set((response.result || []).filter(s => s.name === name).map(s => s.location.uri))]
 }
 
+async function symbolsNamed (name) {
+    const response = await request('workspace/symbol', { query: name })
+    return (response.result || []).filter(s => s.name === name)
+}
+
 const tokens = () => [...new Set(progress.map(p => p.token))]
 const eventsOf = token => progress.filter(p => p.token === token).map(p => p.value)
 
@@ -274,8 +304,8 @@ async function main () {
     check('the workspace crawl ends', firstEnded, firstEnded ? `begin at ${(progress[0].at / 1000).toFixed(1)} s, end at ${(eventsOf(tokens()[0]).length && progress.filter(p => p.token === tokens()[0]).pop().at / 1000).toFixed(1)} s` : `no end within 4 min (${progress.length} progress events)`)
     if (!firstEnded) return
 
-    // A: 14 real functions, zzUnreadable and build/buildFn; C: 3; D: 2
-    checkProgress('first crawl', tokens()[0], 21)
+    // A: 14 real functions, zzUnreadable and build/buildFn; C: 3 and two classdefs; D: 3
+    checkProgress('first crawl', tokens()[0], 24)
     check('exclusion settings were read for each workspace folder',
         [A, C, D].every(folder => ['files.exclude', 'search.exclude'].every(section => configurationItems.some(i => i.scopeUri === folder.uri && i.section === section))),
         JSON.stringify(configurationItems.filter(i => i.section !== 'MATLAB')))
@@ -296,6 +326,40 @@ async function main () {
     check('the folder with two loops is indexed', counts.cfn === 1 && counts.ca === 1 && counts.cb === 1, JSON.stringify([counts.cfn, counts.ca, counts.cb]))
     check('the other folders are indexed', counts.dfn === 1 && counts.dopen === 1, JSON.stringify([counts.dfn, counts.dopen]))
 
+    // --- MATLAB parses a file with a syntax error to no symbols at all, so such a file is
+    // --- listed from the declarations in its text
+    const dbroken = await symbolsNamed('dbroken')
+    const dbrokenLocal = await symbolsNamed('dbrokenLocal')
+    // 12 is SymbolKind.Function, and the name starts at character 13 of the first line
+    check('a function file with a syntax error is listed, local function included',
+        dbroken.length === 1 && dbroken[0].location.uri.endsWith('/D/dbroken.m') && dbroken[0].kind === 12 &&
+            dbroken[0].location.range.start.line === 0 && dbroken[0].location.range.start.character === 13 && dbrokenLocal.length === 1,
+        JSON.stringify({ dbroken, dbrokenLocal }))
+    const kindsAndContainers = async names => (await Promise.all(names.map(symbolsNamed))).map(symbols => symbols.map(s => [s.kind, s.containerName]))
+    const parsedClass = await kindsAndContainers(['PkGood', 'pkGoodMethod', 'pkGoodLocal'])
+    const unparsableClass = await kindsAndContainers(['PkBroken', 'pkBrokenMethod', 'pkBrokenLocal'])
+    check('a classdef with a syntax error is listed with the kinds and containers of a classdef that parses',
+        parsedClass.every(symbols => symbols.length === 1) && JSON.stringify(unparsableClass) === JSON.stringify(parsedClass).replace(/PkGood/g, 'PkBroken'),
+        `parsed ${JSON.stringify(parsedClass)}, with a syntax error ${JSON.stringify(unparsableClass)}`)
+
+    // --- an open document with a syntax error is listed too, and one typed into a syntax
+    // --- error keeps the symbols of its last good parse
+    notify('textDocument/didOpen', {
+        textDocument: { uri: pathToFileURL(path.join(scratch, 'openBroken.m')).href, languageId: 'matlab', version: 1, text: 'function openBroken\nx = (;\nend\n' }
+    })
+    check('an open document with a syntax error is listed', await waitFor(async () => (await symbolUris('openBroken')).length === 1, 20 * 1000))
+    const typedUri = pathToFileURL(path.join(scratch, 'typed.m')).href
+    notify('textDocument/didOpen', { textDocument: { uri: typedUri, languageId: 'matlab', version: 1, text: 'function r = typedGood(x)\nr = x;\nend\n' } })
+    const typedListed = await waitFor(async () => (await symbolUris('typedGood')).length === 1, 20 * 1000)
+    notify('textDocument/didChange', {
+        textDocument: { uri: typedUri, version: 2 },
+        contentChanges: [{ text: 'function r = typedGood(x)\nr = (x;\nend\n\nfunction typedNew\nend\n' }]
+    })
+    // An edit is indexed 500 ms after it is made
+    await sleep(5000)
+    check('a document typed into a syntax error keeps the symbols of its last good parse',
+        typedListed && (await symbolUris('typedGood')).length === 1 && (await symbolUris('typedNew')).length === 0)
+
     // --- adding B crawls B alone, with its own progress
     workspaceFolders = [A, C, D, B]
     notify('workspace/didChangeWorkspaceFolders', { event: { added: [B], removed: [] } })
@@ -312,6 +376,7 @@ async function main () {
     notify('workspace/didChangeWorkspaceFolders', { event: { added: [], removed: [D] } })
     const dropped = await waitFor(async () => (await symbolUris('dfn')).length === 0, 5 * 1000)
     check('a removed folder leaves the index', dropped)
+    check('the file with a syntax error of a removed folder leaves the index', (await symbolUris('dbroken')).length === 0 && (await symbolUris('dbrokenLocal')).length === 0)
     check('an open file of the removed folder stays indexed', (await symbolUris('dopen')).length === 1)
     check('the other folders stay indexed', (await symbolUris('a1')).length === 1 && (await symbolUris('bfn')).length === 1)
 

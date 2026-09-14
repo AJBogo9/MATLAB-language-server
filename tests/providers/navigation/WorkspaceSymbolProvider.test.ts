@@ -3,9 +3,10 @@ import assert from 'assert'
 
 import FileInfoIndex, { CodeInfo } from '../../../src/indexing/FileInfoIndex'
 import WorkspaceSymbolProvider, {
-    classNameFromClassFolder, matchesQuery
+    classNameFromClassFolder, matchesQuery, packageFromUri
 } from '../../../src/providers/navigation/WorkspaceSymbolProvider'
-import { SymbolKind, WorkspaceSymbolParams } from 'vscode-languageserver'
+import { Range, SymbolKind, WorkspaceSymbolParams } from 'vscode-languageserver'
+import { URI } from 'vscode-uri'
 
 /**
  * Driven by the same recorded computeCodeData fixtures the index tests use, so
@@ -119,6 +120,97 @@ describe('WorkspaceSymbolProvider', () => {
         it('should handle a class-folder file without a classdef of its own', () => {
             fileInfoIndex.parseAndStoreCodeInfo('file:///%40MyClass/MyClass.m', MyClass)
             assert.ok(query('').length > 0, 'a file in an @class folder should still contribute symbols')
+        })
+
+        describe('for a file MATLAB could not parse', () => {
+            // What MATLAB's parser returns for such a file has no symbols at all, so
+            // the declarations scanned from its text stand in for them.
+            const summary = (symbols: any[]): any[] =>
+                symbols.map(s => [s.name, s.kind, s.location.uri, s.containerName])
+
+            it('should list the declared functions at the range of each name', () => {
+                fileInfoIndex.storeFallbackDeclarations('file:///broken.m', {
+                    functions: [
+                        { name: 'broken', range: Range.create(0, 9, 0, 15), isMethod: false },
+                        { name: 'brokenLocal', range: Range.create(4, 9, 4, 20), isMethod: false }
+                    ]
+                })
+
+                const symbols = query('')
+                assert.deepEqual(summary(symbols), [
+                    ['broken', SymbolKind.Function, 'file:///broken.m', undefined],
+                    ['brokenLocal', SymbolKind.Function, 'file:///broken.m', undefined]
+                ])
+                assert.deepEqual(symbols[1].location.range, Range.create(4, 9, 4, 20))
+                assert.deepEqual(summary(query('lcl')), [['brokenLocal', SymbolKind.Function, 'file:///broken.m', undefined]])
+            })
+
+            it('should name the class of a method and the package of a class or function, as for a parsed file', () => {
+                const uri = URI.file('/proj/+bank/+core/Account.m').toString()
+                fileInfoIndex.storeFallbackDeclarations(uri, {
+                    classdef: { name: 'Account', range: Range.create(0, 9, 0, 16) },
+                    functions: [
+                        { name: 'deposit', range: Range.create(3, 17, 3, 24), isMethod: true },
+                        { name: 'helper', range: Range.create(9, 9, 9, 15), isMethod: false }
+                    ]
+                })
+
+                assert.deepEqual(summary(query('')), [
+                    ['Account', SymbolKind.Class, uri, 'bank.core'],
+                    ['deposit', SymbolKind.Method, uri, 'Account'],
+                    ['helper', SymbolKind.Function, uri, 'bank.core']
+                ])
+            })
+
+            it('should list the first function of a class-folder file as a method of that class', () => {
+                const uri = URI.file('/proj/@Account/withdraw.m').toString()
+                fileInfoIndex.storeFallbackDeclarations(uri, {
+                    functions: [
+                        { name: 'withdraw', range: Range.create(0, 9, 0, 17), isMethod: false },
+                        { name: 'localCheck', range: Range.create(5, 9, 5, 19), isMethod: false }
+                    ]
+                })
+
+                assert.deepEqual(summary(query('')), [
+                    ['withdraw', SymbolKind.Method, uri, 'Account'],
+                    ['localCheck', SymbolKind.Function, uri, undefined]
+                ])
+            })
+
+            it('should not list a file twice when it also has a parsed entry', () => {
+                fileInfoIndex.parseAndStoreCodeInfo('file:///F_1.m', F_1)
+                const parsed = summary(query(''))
+                assert.ok(parsed.length > 0)
+                fileInfoIndex.fallbackDeclarations.set('file:///F_1.m', {
+                    functions: [{ name: 'fun', range: Range.create(0, 9, 0, 12), isMethod: false }]
+                })
+
+                assert.deepEqual(summary(query('')), parsed)
+            })
+
+            it('should cap what an empty query returns', () => {
+                for (let i = 0; i < 400; i++) {
+                    fileInfoIndex.storeFallbackDeclarations(`file:///broken_${i}.m`, {
+                        functions: [{ name: 'broken', range: Range.create(0, 9, 0, 15), isMethod: false }]
+                    })
+                }
+                assert.equal(query('').length, 256)
+            })
+        })
+    })
+
+    describe('#packageFromUri', () => {
+        it('should join the package folders that hold the file', () => {
+            assert.equal(packageFromUri(URI.file('/proj/+bank/+core/deposit.m').toString()), 'bank.core')
+        })
+
+        it('should skip the class folder that holds the file', () => {
+            assert.equal(packageFromUri(URI.file('/proj/+bank/@Account/deposit.m').toString()), 'bank')
+        })
+
+        it('should return an empty package outside a package folder', () => {
+            assert.equal(packageFromUri(URI.file('/proj/deposit.m').toString()), '')
+            assert.equal(packageFromUri(URI.file('/proj/+bank/private/deposit.m').toString()), '')
         })
     })
 
