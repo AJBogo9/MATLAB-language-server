@@ -26,6 +26,7 @@ describe('HoverSupportProvider', () => {
     let documentManager: TextDocuments<TextDocument>
     let mockMvm: any
     let mockDocument: TextDocument
+    let fileInfoIndex: FileInfoIndex
 
     const URI = 'file:///test.m'
 
@@ -35,7 +36,7 @@ describe('HoverSupportProvider', () => {
         mockMvm.isReady.returns(true)
         mockMvm.getMatlabRelease.returns('R2026a')
 
-        const fileInfoIndex = new FileInfoIndex()
+        fileInfoIndex = new FileInfoIndex()
         provider = new HoverSupportProvider(matlabLifecycleManager, mockMvm, fileInfoIndex)
 
         documentManager = new TextDocuments(TextDocument)
@@ -64,6 +65,80 @@ describe('HoverSupportProvider', () => {
 
     const stubMatlab = (data: any): sinon.SinonStub =>
         sinon.stub(provider as any, 'retrieveHoverData').resolves(data)
+
+    /** An identifier as the indexer reports it, with one component per dotted part. */
+    const rawIdentifier = (name: string, line: number, character: number): any => {
+        let start = character
+        const components = name.split('.').map(part => {
+            const component = { name: part, range: [line, start, line, start + part.length] }
+            start += part.length + 1
+            return component
+        })
+        return { name, range: [line, character, line, start - 1], components }
+    }
+
+    /** A scope's variables. Every definition is a reference too, as in the code data MATLAB records. */
+    const rawVariables = (definitions: any[], uses: any[], calls: any[] = []): any => ({
+        variableDefinitions: definitions,
+        variableReferences: [...definitions, ...uses],
+        functionOrUnboundReferences: calls,
+        globals: []
+    })
+
+    /** A function whose name starts on `line` (0 by default) at `character`. */
+    const rawFunction = (
+        fn: { name: string, line?: number, character: number, endLine: number, inputArgs: string[], outputArgs: string[] },
+        variables: any
+    ): any => {
+        const line = fn.line ?? 0
+        return {
+            ...variables,
+            declarationNameId: { name: fn.name, range: [line, fn.character, line, fn.character + fn.name.length] },
+            range: [line, 0, fn.endLine, 3],
+            isPublic: true,
+            isPrototype: false,
+            isConstructor: false,
+            isStaticMethod: false,
+            inputArgs: fn.inputArgs,
+            outputArgs: fn.outputArgs,
+            nestedScopes: []
+        }
+    }
+
+    /** A file declaring a class on line 0, with its properties and the methods written inside it. */
+    const rawClassdef = (name: string, endLine: number, properties: any[], methods: any[]): any => ({
+        ...rawVariables([], []),
+        functionScopes: [],
+        classScope: {
+            declarationNameId: { name, range: [0, 9, 0, 9 + name.length] },
+            range: [0, 0, endLine, 3],
+            isPublic: true,
+            baseClasses: [],
+            propertiesBlocks: [],
+            enumerationsBlocks: [],
+            methodsBlocks: [],
+            properties,
+            enumerations: [],
+            nestedScopes: methods
+        }
+    })
+
+    const store = (uri: string, globalScope: any, hasClassInfo = false): void => {
+        fileInfoIndex.parseAndStoreCodeInfo(uri, {
+            package: '', sections: [], classReferences: [], hasClassInfo, globalScope
+        } as any)
+    }
+
+    /** Stores index data for the test document: at the top level, or in one function declared on line 0. */
+    const index = (
+        definitions: any[], uses: any[],
+        fn?: { name: string, character: number, endLine: number, inputArgs: string[], outputArgs: string[] }
+    ): void => {
+        const variables = rawVariables(definitions, uses)
+        store(URI, fn == null
+            ? { ...variables, functionScopes: [] }
+            : { ...rawVariables([], []), functionScopes: [rawFunction(fn, variables)] })
+    }
 
     before(() => ClientConnection._setConnection(getMockConnection()))
     after(() => ClientConnection._clearConnection())
@@ -148,6 +223,7 @@ describe('HoverSupportProvider', () => {
             // arguments, properties, methods, events, enumeration and import are
             // context-sensitive, not reserved, so they are all legal identifiers.
             setup('properties = struct();\ny = properties;')
+            index([rawIdentifier('properties', 0, 0), rawIdentifier('y', 1, 0)], [rawIdentifier('properties', 1, 4)])
             classifyAs(SymbolClassification.Variable, 'properties')
             const matlab = stubMatlab({ helpText: 'should never be reached' })
 
@@ -194,6 +270,7 @@ describe('HoverSupportProvider', () => {
             // help('idx') resolves to `fix` and help('i') to the imaginary unit,
             // so a variable card must never be sourced from help.
             setup('idx = 1;\ny = idx + 2;')
+            index([rawIdentifier('idx', 0, 0), rawIdentifier('y', 1, 0)], [rawIdentifier('idx', 1, 4)])
             classifyAs(SymbolClassification.Variable, 'idx')
             const matlab = stubMatlab({ helpText: ' fix - Round toward zero' })
 
@@ -257,10 +334,11 @@ describe('HoverSupportProvider', () => {
         })
 
         it('should not call a struct field access a local variable', async () => {
-            setup('y = opts.Method;')
+            setup('opts = struct();\ny = opts.Method;')
+            index([rawIdentifier('opts', 0, 0), rawIdentifier('y', 1, 0)], [rawIdentifier('opts.Method', 1, 4)])
             classifyAs(SymbolClassification.Variable, 'opts')
 
-            const text = valueOf(await provider.handleHoverRequest(paramsAt(0, 5), documentManager))
+            const text = valueOf(await provider.handleHoverRequest(paramsAt(1, 5), documentManager))
 
             assert.ok(!text.includes('local variable'),
                 'the index classifies field access and method calls as variable references too')
@@ -283,6 +361,167 @@ describe('HoverSupportProvider', () => {
             assert.ok(text.includes('(1,1) double'), 'the declared type should be shown')
             assert.ok(text.includes('mustBePositive'), 'the validator should be shown')
             assert.ok(text.includes('1e-6'), 'the default should be shown')
+        })
+
+        describe('without an arguments block', () => {
+            // Lines are 0-based here and 1-based in the card, as in the editor gutter
+            const SCALE = [
+                'function y = scale(x)',      // 0
+                '    gain = 2;',              // 1
+                '    offset = gain + ...',    // 2
+                '        1;',                 // 3
+                '    y = gain * x + offset;', // 4
+                'end'                         // 5
+            ]
+            const SCALE_FUNCTION = { name: 'scale', character: 13, endLine: 5, inputArgs: ['x'], outputArgs: ['y'] }
+
+            const indexScale = (): void => index(
+                [
+                    rawIdentifier('y', 0, 9), rawIdentifier('x', 0, 19), rawIdentifier('gain', 1, 4),
+                    rawIdentifier('offset', 2, 4), rawIdentifier('y', 4, 4)
+                ],
+                [rawIdentifier('gain', 2, 13), rawIdentifier('gain', 4, 8), rawIdentifier('x', 4, 15), rawIdentifier('offset', 4, 19)],
+                SCALE_FUNCTION
+            )
+
+            it('should show the line that first assigns a variable used later', async () => {
+                setup(SCALE.join('\n'))
+                indexScale()
+
+                const text = valueOf(await provider.handleHoverRequest(paramsAt(4, 9), documentManager))
+
+                assert.strictEqual(text, '**gain**  ·  variable\n\n```matlab\ngain = 2;\n```\n\n_first assigned on line 2_')
+            })
+
+            it('should join an assignment continued onto the next line', async () => {
+                setup(SCALE.join('\n'))
+                indexScale()
+
+                const text = valueOf(await provider.handleHoverRequest(paramsAt(4, 20), documentManager))
+
+                assert.strictEqual(text, '**offset**  ·  variable\n\n```matlab\noffset = gain + 1;\n```\n\n_first assigned on line 3_')
+            })
+
+            it('should show no card on the line that first assigns it', async () => {
+                setup(SCALE.join('\n'))
+                indexScale()
+                const matlab = stubMatlab({ helpText: ' gain - Gain of a system' })
+
+                assert.strictEqual(await provider.handleHoverRequest(paramsAt(1, 5), documentManager), null)
+                assert.strictEqual(matlab.called, false, 'no card because the line is in view, not because help() had none')
+            })
+
+            it('should name the function an input argument belongs to', async () => {
+                setup(SCALE.join('\n'))
+                indexScale()
+
+                const text = valueOf(await provider.handleHoverRequest(paramsAt(4, 15), documentManager))
+
+                assert.strictEqual(text, '**x**  ·  variable\n\n```matlab\nfunction y = scale(x)\n```\n\n_input argument of scale_')
+            })
+
+            it('should name the function an output argument belongs to', async () => {
+                setup(SCALE.join('\n'))
+                indexScale()
+
+                const text = valueOf(await provider.handleHoverRequest(paramsAt(4, 4), documentManager))
+
+                assert.strictEqual(text, '**y**  ·  variable\n\n```matlab\nfunction y = scale(x)\n```\n\n_output argument of scale_')
+            })
+
+            it('should show no card when the index has no definition in this file', async () => {
+                setup(['function y = scale(x)', '    y = gain * x;', 'end'].join('\n'))
+                index(
+                    [rawIdentifier('y', 0, 9), rawIdentifier('x', 0, 19), rawIdentifier('y', 1, 4)],
+                    [rawIdentifier('gain', 1, 8), rawIdentifier('x', 1, 15)],
+                    { ...SCALE_FUNCTION, endLine: 2 }
+                )
+                const matlab = stubMatlab({ helpText: ' gain - Gain of a system' })
+
+                assert.strictEqual(await provider.handleHoverRequest(paramsAt(1, 9), documentManager), null)
+                assert.strictEqual(matlab.called, false)
+            })
+
+            it('should show no card when the line the index names no longer assigns the variable', async () => {
+                // Renamed in the buffer before the index caught up
+                setup(SCALE.join('\n').replace('    gain = 2;', '    gains = 2;'))
+                indexScale()
+                const matlab = stubMatlab({ helpText: ' gain - Gain of a system' })
+
+                assert.strictEqual(await provider.handleHoverRequest(paramsAt(4, 9), documentManager), null)
+                assert.strictEqual(matlab.called, false)
+            })
+
+            it('should leave the card of an argument declared in an arguments block as it was', async () => {
+                setup(['function y = f(x)', 'arguments', '    x (1,1) double', 'end', 'y = x;', 'end'].join('\n'))
+                index(
+                    [rawIdentifier('y', 0, 9), rawIdentifier('x', 0, 15), rawIdentifier('y', 4, 0)],
+                    [rawIdentifier('x', 2, 4), rawIdentifier('x', 4, 4)],
+                    { name: 'f', character: 13, endLine: 5, inputArgs: ['x'], outputArgs: ['y'] }
+                )
+
+                assert.strictEqual(valueOf(await provider.handleHoverRequest(paramsAt(4, 4), documentManager)),
+                    '**x**  ·  variable\n\n```matlab\nx  (1,1) double\n```\n\n_declared in an arguments block, line 3_')
+            })
+
+            it('should show no card for a property declared only in another file of its class folder', async () => {
+                // The index gives its declaration in @Amp/Amp.m, on that file's line 3:
+                //   classdef Amp
+                //       properties
+                //           Gain = 2
+                const METHOD_URI = 'file:///work/%40Amp/amplify.m'
+                setup('')
+                ;(documentManager.get as sinon.SinonStub).returns(TextDocument.create(METHOD_URI, 'matlab', 1, [
+                    'function y = amplify(obj, x)', // 0
+                    '    y = x;',                   // 1
+                    '    y = y * obj.Gain;',        // 2, only a use in this file
+                    '    disp(obj.Gain)',           // 3
+                    'end'                           // 4
+                ].join('\n')))
+                store('file:///work/%40Amp/Amp.m', rawClassdef('Amp', 4, [{ name: 'Gain', range: [2, 8, 2, 12], isPublic: true }], []), true)
+                store(METHOD_URI, {
+                    ...rawVariables([], []),
+                    functionScopes: [rawFunction(
+                        { name: 'amplify', character: 13, endLine: 4, inputArgs: ['obj', 'x'], outputArgs: ['y'] },
+                        rawVariables(
+                            [rawIdentifier('y', 0, 9), rawIdentifier('obj', 0, 21), rawIdentifier('x', 0, 26), rawIdentifier('y', 1, 4), rawIdentifier('y', 2, 4)],
+                            [rawIdentifier('x', 1, 8), rawIdentifier('y', 2, 8), rawIdentifier('obj.Gain', 2, 12), rawIdentifier('obj.Gain', 3, 9)],
+                            [rawIdentifier('disp', 3, 4)]
+                        )
+                    )]
+                }, true)
+                const matlab = stubMatlab({ helpText: ' gain - Gain of a system' })
+
+                const params: HoverParams = { textDocument: { uri: METHOD_URI }, position: { line: 3, character: 14 } }
+                assert.strictEqual(await provider.handleHoverRequest(params, documentManager), null)
+                assert.strictEqual(matlab.called, false)
+            })
+
+            it('should show no card for a method called on its object', async () => {
+                // The index gives the method's declaration line as the definition of obj.increment
+                setup([
+                    'classdef Counter',                // 0
+                    '    methods',                     // 1
+                    '        function increment(obj)', // 2
+                    '        end',                     // 3
+                    '        function reset(obj)',     // 4
+                    '            obj.increment();',    // 5
+                    '        end',                     // 6
+                    '    end',                         // 7
+                    'end'                              // 8
+                ].join('\n'))
+                const method = { inputArgs: ['obj'], outputArgs: [] }
+                store(URI, rawClassdef('Counter', 8, [], [
+                    rawFunction({ ...method, name: 'increment', line: 2, character: 17, endLine: 3 },
+                        rawVariables([rawIdentifier('obj', 2, 27)], [])),
+                    rawFunction({ ...method, name: 'reset', line: 4, character: 17, endLine: 6 },
+                        rawVariables([rawIdentifier('obj', 4, 23)], [rawIdentifier('obj.increment', 5, 12)]))
+                ]), true)
+                const matlab = stubMatlab({ helpText: ' increment - saved help text' })
+
+                assert.strictEqual(await provider.handleHoverRequest(paramsAt(5, 18), documentManager), null)
+                assert.strictEqual(matlab.called, false)
+            })
         })
     })
 

@@ -2,7 +2,7 @@
 import assert from 'assert'
 
 import {
-    buildOfflineSymbolInfo, extractDocComment, extractSignature, findDeclarationLine
+    buildOfflineSymbolInfo, extractDocComment, extractSignature, findDeclarationLine, parseFunctionDeclaration
 } from '../../../src/providers/hover/OfflineHoverBuilder'
 
 /**
@@ -116,6 +116,35 @@ describe('OfflineHoverBuilder', () => {
 
         it('should drop a trailing comment', () => {
             assert.equal(extractSignature(['function f(x) % does a thing'], 0), 'f(x)')
+        })
+    })
+
+    describe('#parseFunctionDeclaration', () => {
+        it('should read a bracketed output list and an ignored input', () => {
+            assert.deepEqual(parseFunctionDeclaration(['function [a, b] = split(x, ~) % halves'], 0),
+                { name: 'split', inputs: ['x', '~'], outputs: ['a', 'b'] })
+        })
+
+        it('should read a declaration continued onto the next line', () => {
+            assert.deepEqual(parseFunctionDeclaration(['function [lo, ...', '        hi] = bounds(values)'], 0),
+                { name: 'bounds', inputs: ['values'], outputs: ['lo', 'hi'] })
+        })
+
+        it('should read a property set method, whose name is dotted', () => {
+            assert.deepEqual(parseFunctionDeclaration(['    function obj = set.Gain(obj, value)'], 0),
+                { name: 'set.Gain', inputs: ['obj', 'value'], outputs: ['obj'] })
+        })
+
+        it('should read a declaration without arguments', () => {
+            assert.deepEqual(parseFunctionDeclaration(['function run'], 0), { name: 'run', inputs: [], outputs: [] })
+        })
+
+        it('should read nothing from a declaration still being typed', () => {
+            assert.deepEqual(parseFunctionDeclaration(['function [a, b'], 0), { name: '', inputs: [], outputs: [] })
+        })
+
+        it('should return null for a line that declares no function', () => {
+            assert.equal(parseFunctionDeclaration(['functionHandle = @sin;'], 0), null)
         })
     })
 

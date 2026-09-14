@@ -405,6 +405,19 @@ async function main () {
             subseq.some(s => s.name === 'hoverSmoke'),
             'query "hS" -> ' + subseq.map(s => s.name).join(', '))
 
+        // --- a variable without an arguments block is described by the line the index says
+        // --- first assigns it, which needs the index the open document built
+        const plainVariable = await hoverAt(8, 8)
+        const plainVariableCard = plainVariable != null ? plainVariable.contents.value : ''
+        check('hover on a plain variable shows the line that first assigns it',
+            plainVariableCard.includes('```matlab\nz = localHelper(y);\n```') && plainVariableCard.includes('_first assigned on line 8_'),
+            plainVariableCard.split('\n').join(' | ') || '(null)')
+        const inputArgument = await hoverAt(14, 6)
+        const inputArgumentCard = inputArgument != null ? inputArgument.contents.value : ''
+        check('hover on an input argument names its function',
+            inputArgumentCard.includes('function out = localHelper(a)') && inputArgumentCard.includes('_input argument of localHelper_'),
+            inputArgumentCard.split('\n').join(' | ') || '(null)')
+
         // --- completions and signature help, which exercise the MVM wire
         // --- format including the `shared` block that was being filtered out.
         const COMP_URI = 'file:///tmp/completionSmoke.m'

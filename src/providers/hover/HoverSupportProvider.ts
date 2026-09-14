@@ -1,6 +1,6 @@
 // Copyright 2026 Andreas Bogossian
 
-import { CancellationToken, Hover, HoverParams, MarkupKind, Range, TextDocuments } from 'vscode-languageserver'
+import { CancellationToken, Hover, HoverParams, Location, MarkupKind, Range, TextDocuments } from 'vscode-languageserver'
 import { TextDocument } from 'vscode-languageserver-textdocument'
 import { URI } from 'vscode-uri'
 import MatlabLifecycleManager from '../../lifecycle/MatlabLifecycleManager'
@@ -9,14 +9,17 @@ import Logger from '../../logging/Logger'
 import parse from '../../mvm/MdaParser'
 import FileInfoIndex from '../../indexing/FileInfoIndex'
 import {
-    classifySymbolAtPosition, RequestType, SymbolClassification, reportTelemetry
+    classifySymbolAtPosition, findDefinitionsInFile, RequestType, SymbolClassification, reportTelemetry
 } from '../../indexing/SymbolSearchService'
 import { getExpressionAtPosition } from '../../utils/ExpressionUtils'
 import { isSameFilePath } from '../../utils/FileNameUtils'
+import { isPositionLessThan } from '../../utils/PositionUtils'
 import { isInCommentOrString } from './CommentStringScanner'
 import { escapeMarkdown } from './DocCommentMarkdown'
 import { getOperatorHelp, findOperatorAtPosition, isReservedKeyword } from './OperatorHelp'
-import { buildOfflineSymbolInfo, renderArgumentsTable, OfflineSymbolInfo } from './OfflineHoverBuilder'
+import {
+    buildOfflineSymbolInfo, joinContinuations, parseFunctionDeclaration, renderArgumentsTable, OfflineSymbolInfo
+} from './OfflineHoverBuilder'
 import HoverCache from './HoverCache'
 import { renderArgumentDescriptions } from '../argumentDocs/ArgumentDescriptionMarkdown'
 import ArgumentDocSource from '../argumentDocs/ArgumentDocSource'
@@ -168,10 +171,8 @@ class HoverSupportProvider {
         if (classified?.classification === SymbolClassification.Variable ||
             (classified == null && this.declaresArgument(text, lines, line, topic))) {
             // The dotted target, so hovering Method in opts.Method finds the opts.Method declaration
-            return this.toHover(
-                this.renderVariableCard(expression.unqualifiedTarget, text, topic, line),
-                hoverRange
-            )
+            const variableCard = this.renderVariableCard(expression.unqualifiedTarget, text, topic, params, documentManager)
+            return variableCard != null ? this.toHover(variableCard, hoverRange) : null
         }
 
         const cacheKey = HoverCache.keyFor(topic, this.mvm.getMatlabRelease() ?? 'unknown')
@@ -233,6 +234,18 @@ class HoverSupportProvider {
             Logger.error('Error caught while classifying hover target:')
             Logger.error(err as string)
             return null
+        }
+    }
+
+    private findDefinitions (params: HoverParams, documentManager: TextDocuments<TextDocument>): Location[] {
+        try {
+            return findDefinitionsInFile(
+                params.textDocument.uri, params.position, this.fileInfoIndex, documentManager, RequestType.Hover
+            )
+        } catch (err) {
+            Logger.error('Error caught while finding definitions of hover target:')
+            Logger.error(err as string)
+            return []
         }
     }
 
@@ -305,15 +318,19 @@ class HoverSupportProvider {
     }
 
     /**
-     * Renders the card for a variable.
+     * Renders the card for a variable, or null when this file says nothing about it.
      *
      * There is deliberately no help() content here. What the code itself says
      * about the variable is the only sound static answer; a live value would
      * reflect the last run rather than the buffer, so it belongs behind an
      * explicit opt-in and an explicit staleness label, not here.
      */
-    private renderVariableCard (name: string, documentText: string, symbolName: string, line: number): string {
+    private renderVariableCard (
+        name: string, documentText: string, symbolName: string, params: HoverParams,
+        documentManager: TextDocuments<TextDocument>
+    ): string | null {
         const parts: string[] = ['**' + name + '**  ·  variable']
+        const line = params.position.line
 
         // An arguments block declaration is the richest static statement about a
         // variable that MATLAB itself cannot give you.
@@ -345,11 +362,39 @@ class HoverSupportProvider {
             }
         }
 
-        // Say only what is known. The index classified this as a variable
+        // Otherwise the line that first defines it, where Go to Definition goes. Say
+        // only what that line shows. The index classified this as a variable
         // reference, which also covers struct field access and method calls, so
         // asserting "local variable" would be wrong for `opts.Method` and for
         // `obj.doThing`.
-        parts.push('', '_no declaration found in this file_')
+        const definitions = this.findDefinitions(params, documentManager)
+        if (definitions.length === 0) {
+            return null
+        }
+        const first = definitions.reduce((earliest, definition) =>
+            isPositionLessThan(definition.range.start, earliest.range.start) ? definition : earliest)
+        const definitionLine = first.range.start.line
+
+        // A definition on the hovered line is already in view. The index lags behind
+        // edits, so a line that no longer names the variable would show unrelated code.
+        if (definitionLine === line || !(lines[definitionLine] ?? '').split(/[^A-Za-z0-9_]+/).includes(name)) {
+            return null
+        }
+
+        const source = joinContinuations(lines, definitionLine).text.trim()
+        const declaration = parseFunctionDeclaration(lines, definitionLine)
+        if (declaration == null) {
+            parts.push('', '```matlab', source, '```', '', '_first assigned on line ' + String(definitionLine + 1) + '_')
+            return parts.join('\n')
+        }
+
+        // Only arguments are defined on a declaration line. Anything else the index
+        // found there, such as a method name, is not a variable this card describes.
+        const kind = declaration.inputs.includes(name) ? 'input' : declaration.outputs.includes(name) ? 'output' : null
+        if (kind == null) {
+            return null
+        }
+        parts.push('', '```matlab', source, '```', '', '_' + kind + ' argument of ' + declaration.name + '_')
         return parts.join('\n')
     }
 

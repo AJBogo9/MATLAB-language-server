@@ -46,6 +46,9 @@ export interface OfflineSymbolInfo {
 }
 
 const FUNCTION_DECLARATION = /^\s*function\s+(?:\[[^\]]*\]\s*=\s*|[A-Za-z][A-Za-z0-9_]*\s*=\s*)?([A-Za-z][A-Za-z0-9_]*)\s*(?:\(|$|%)/
+// Captures the outputs, the name and the inputs. Unlike FUNCTION_DECLARATION it accepts a
+// dotted name (`set.Prop`) and an input list still being typed, which has no `)` yet.
+const FUNCTION_DECLARATION_PARTS = /^\s*function\s+(?:(\[[^\]]*\]|[A-Za-z][A-Za-z0-9_]*)\s*=\s*)?([A-Za-z][A-Za-z0-9_.]*)\s*(?:\(([^)]*))?/
 const CLASSDEF_DECLARATION = /^\s*classdef\s*(?:\([^)]*\)\s*)?([A-Za-z][A-Za-z0-9_]*)\b/
 const COMMENT_LINE = /^\s*%/
 // Deliberately looser than FUNCTION_DECLARATION: a scope ends at the next
@@ -108,21 +111,46 @@ export function findDeclarationLine (
 /**
  * Joins a logical line that continues across physical lines with `...`.
  *
+ * Each joint becomes a single space, so the text reads as if written on one line.
+ *
  * @param lines The document split into lines
  * @param start The 0-based first physical line
  * @returns The joined text and the last physical line consumed
  */
-function joinContinuations (lines: string[], start: number): { text: string, endLine: number } {
+export function joinContinuations (lines: string[], start: number): { text: string, endLine: number } {
     let text = lines[start] ?? ''
     let i = start
 
     while (/\.\.\.\s*$/.test(text.trimEnd()) && i + 1 < lines.length) {
-        text = text.trimEnd().replace(/\.\.\.$/, ' ')
+        text = text.trimEnd().replace(/\s*\.\.\.$/, ' ')
         i++
-        text += lines[i]
+        text += lines[i].trimStart()
     }
 
     return { text, endLine: i }
+}
+
+/**
+ * Reads the name and the argument names of the function declared on a line.
+ *
+ * @param lines The document split into lines
+ * @param line The 0-based line, the first one when the declaration is continued
+ * @returns The function name with its input and output argument names, or null when the
+ *     line declares no function. A declaration too incomplete to read has no name and
+ *     no arguments.
+ */
+export function parseFunctionDeclaration (
+    lines: string[], line: number
+): { name: string, inputs: string[], outputs: string[] } | null {
+    const declaration = joinContinuations(lines, line).text.replace(/%.*$/, '')
+    if (!/^\s*function\b/.test(declaration)) {
+        return null
+    }
+
+    const match = FUNCTION_DECLARATION_PARTS.exec(declaration)
+    const names = (list: string | undefined): string[] => (list ?? '').split(/[\s,[\]]+/).filter(name => name !== '')
+
+    return { name: match?.[2] ?? '', inputs: names(match?.[3]), outputs: names(match?.[1]) }
 }
 
 /**

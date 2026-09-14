@@ -324,6 +324,41 @@ export function classifySymbolAtPosition (
     }
 }
 
+/**
+ * Finds the definitions of the identifier at a position that lie in the same document.
+ *
+ * Unlike {@link findDefinitions}, this never searches the MATLAB path, so it needs
+ * no PathResolver or Indexer and is synchronous. Hover needs exactly that: it fires
+ * on every mouse settle and must not wait on MATLAB. Definitions of a class member
+ * found in another file of its class folder are left out.
+ *
+ * Ranges in returned locations should not be modified.
+ *
+ * @param uri The URI of the document
+ * @param position The position in the document
+ * @param fileInfoIndex The file info index
+ * @param documentManager The document manager
+ * @param requestType The type of request being made (used for telemetry reporting)
+ * @returns Locations of the definitions in the document, empty if there are none
+ */
+export function findDefinitionsInFile (
+    uri: string, position: Position, fileInfoIndex: FileInfoIndex, documentManager: TextDocuments<TextDocument>,
+    requestType: RequestType
+): Location[] {
+    const defsParams = getScopedIdAndCodeInfo(
+        uri, position, fileInfoIndex, documentManager, requestType
+    )
+
+    if (defsParams == null) {
+        return []
+    }
+
+    const [scopedId, codeInfo] = defsParams
+
+    return findRefsOrDefs(scopedId, codeInfo, ResultType.Definitions)
+        .filter(location => location.uri === uri)
+}
+
 //////////////////////// Finding identifier at cursor position /////////////////////////
 
 /**
